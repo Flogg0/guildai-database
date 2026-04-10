@@ -240,7 +240,20 @@ def _remote_run_for_spec(spec, args):
     return remote_impl_support.one_run(spec, args)
 
 
+def _is_run_id_prefix(spec):
+    import re
+    return bool(re.match(r'^[0-9a-f]{4,32}$', spec))
+
+
 def _local_run_for_spec(spec):
+    if _is_run_id_prefix(spec):
+        return util.find_apply(
+            [
+                run_util.run_for_run_dir,
+                one_run,
+            ],
+            spec,
+        )
     return util.find_apply(
         [
             run_util.run_for_run_dir,

@@ -13,3 +13,5 @@ venv
 .venv
 .DS_Store
 .python-version
+.guild_index.db
+.guild_index.db-*

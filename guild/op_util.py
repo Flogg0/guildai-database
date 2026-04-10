@@ -637,7 +637,10 @@ def init_run(path=None):
         path = os.path.join(var.runs_dir(), run_id)
     else:
         run_id = os.path.basename(path)
-    return runlib.Run(run_id, path)
+    run = runlib.Run(run_id, path)
+    if os.path.dirname(path) == var.runs_dir():
+        var.index_register_run(run)
+    return run
 
 
 def set_run_marker(run, marker):
@@ -652,6 +655,7 @@ def clear_run_marker(run, marker):
 def set_run_pending(run):
     set_run_marker(run, "PENDING")
     clear_run_marker(run, "STAGED")
+    var.index_update_status(run, "pending")
 
 
 def clear_run_pending(run):
@@ -685,10 +689,17 @@ def set_run_started(run):
     run.write_attr("started", started)
 
 
-def set_run_staged(run):
-    set_run_marker(run, "STAGED")
-    clear_run_pending(run)
+def set_run_running(run):
     set_run_started(run)
+    var.index_update_status(run, "running")
+
+
+def set_run_staged(run):
+    with var.index_batch_writes():
+        set_run_marker(run, "STAGED")
+        clear_run_pending(run)
+        set_run_started(run)
+        var.index_update_status(run, "staged")
 
 
 ###################################################################

@@ -77,12 +77,45 @@ class Run:
         self.path = path
         self._guild_dir = os.path.join(self.path, ".guild")
         self._opref = None
+        self._index_row = None
         self._props = util.PropertyCache(
             [
                 ("timestamp", None, self._get_timestamp, 1.0),
                 ("pid", None, self._get_pid, 1.0),
             ]
         )
+
+    def _ensure_index_row(self):
+        if self._index_row is not None:
+            return self._index_row
+        try:
+            from guild import var
+            import sqlite3
+            conn = var._get_index_conn()
+            row = conn.execute(
+                "SELECT status, opref, started, initialized, label, flags, tags"
+                " FROM runs WHERE run_id = ?",
+                (self.id,),
+            ).fetchone()
+            if row:
+                import json
+                self._index_row = {
+                    "status": row[0],
+                    "opref": row[1],
+                    "started": row[2],
+                    "initialized": row[3],
+                    "label": row[4],
+                    "flags": json.loads(row[5]) if row[5] else None,
+                    "tags": json.loads(row[6]) if row[6] else None,
+                }
+                return self._index_row
+        except sqlite3.DatabaseError:
+            from guild import var
+            var._nuke_index()
+        except Exception:
+            pass
+        self._index_row = {}
+        return self._index_row
 
     @property
     def short_id(self):
@@ -107,6 +140,10 @@ class Run:
         return self._opref
 
     def _read_opref(self):
+        row = self._ensure_index_row()
+        cached = row.get("opref")
+        if cached:
+            return cached
         return util.try_read(self._opref_path())
 
     def _opref_path(self):
@@ -141,6 +178,10 @@ class Run:
 
     @property
     def status(self):
+        row = self._ensure_index_row()
+        cached = row.get("status")
+        if cached:
+            return cached
         if os.path.exists(self.guild_path("LOCK.remote")):
             return "running"
         if os.path.exists(self.guild_path("PENDING")):
@@ -205,7 +246,14 @@ class Run:
             except KeyError:
                 pass
 
+    _INDEX_READABLE = frozenset(("flags", "tags", "label", "started", "initialized"))
+
     def __getitem__(self, name):
+        if name in self._INDEX_READABLE:
+            row = self._ensure_index_row()
+            val = row.get(name)
+            if val is not None:
+                return val
         try:
             f = open(self._attr_path(name), "r")
         except IOError as e:
@@ -236,13 +284,23 @@ class Run:
             return self._guild_dir
         return os.path.join(*((self._guild_dir,) + tuple(subpath)))
 
+    _INDEX_ATTRS = frozenset(("flags", "tags", "label", "started", "initialized"))
+
     def write_attr(self, name, val, raw=False):
         if not raw:
-            val = yaml_util.encode_yaml(val, strict=True)
+            encoded = yaml_util.encode_yaml(val, strict=True)
+        else:
+            encoded = val
         with open(self._attr_path(name), "w") as f:
-            f.write(val)
+            f.write(encoded)
             f.write(os.linesep)
             f.close()
+        if name in self._INDEX_ATTRS:
+            try:
+                from guild import var
+                var.index_update_attr(self, name, val if not raw else encoded)
+            except Exception:
+                pass
 
     def del_attr(self, name):
         try:

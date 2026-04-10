@@ -130,14 +130,40 @@ def filtered_runs(args, ctx=None):
     if getattr(args, "remote", None):
         return remote_impl_support.filtered_runs(args)
     try:
+        base_sql, base_params = _runs_filter_sql(args, ctx)
         return filter_util.filtered_runs(
             args.filter_expr,
             root=_runs_root_for_args(args),
             sort=["-timestamp"],
             base_filter=_runs_filter(args, ctx),
+            base_sql=base_sql,
+            base_params=base_params,
         )
     except SyntaxError as e:
         _filter_syntax_error(e)
+
+
+def _runs_filter_sql(args, ctx):
+    true_status, false_status = _status_filter_args(args)
+    op_refs = getattr(args, "filter_ops", None) or None
+    label_terms = getattr(args, "filter_labels", None) or None
+    unlabeled = getattr(args, "filter_unlabeled", False)
+    tag_terms = getattr(args, "filter_tags", None) or None
+    started_range = None
+    if getattr(args, "filter_started", None):
+        try:
+            started_range = _parse_timerange(args.filter_started, ctx)
+        except Exception:
+            pass
+    return var._compile_base_filters(
+        status_include=true_status or None,
+        status_exclude=false_status or None,
+        op_refs=op_refs,
+        label_terms=label_terms,
+        unlabeled=unlabeled,
+        tag_terms=tag_terms,
+        started_range=started_range,
+    )
 
 
 def _filter_syntax_error(e) -> typing.NoReturn:

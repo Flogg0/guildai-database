@@ -145,7 +145,8 @@ def _run_trials(batch_run, trials):
 
 
 def _init_trial_runs(batch_run, trials):
-    return [init_trial_run(batch_run, trial) for trial in trials]
+    with var.index_batch_writes():
+        return [init_trial_run(batch_run, trial) for trial in trials]
 
 
 def init_trial_run(batch_run, trial_flag_vals, run_dir=None):

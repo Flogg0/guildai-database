@@ -61,7 +61,21 @@ def filtered_runs(
     force_root=False,
     index=None,
     base_runs=None,
+    base_sql=None,
+    base_params=None,
 ):
+    if isinstance(filter, str):
+        filter = filterlib.parser().parse(filter) if filter else None
+    if not force_root:
+        result = var.index_query_runs(
+            root=root,
+            filter_expr=filter,
+            base_sql=base_sql,
+            base_params=base_params,
+            sort=sort,
+        )
+        if result is not None:
+            return result
     runs = var.runs(
         root=root,
         sort=sort,
@@ -71,8 +85,6 @@ def filtered_runs(
     )
     if not filter:
         return runs
-    if isinstance(filter, str):
-        filter = filterlib.parser().parse(filter)
     index = index or indexlib.RunIndex()
     index.refresh(runs, _index_refresh_types(filter))
     return [run for run in runs if _filter_run(filter, run, index)]

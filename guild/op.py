@@ -124,13 +124,15 @@ def _op_init_run_attrs(op, run):
 
 
 def stage(op, continue_on_deps_error=False):
-    run = init_run(op)
-    try:
-        _stage_run_proc_env(op, run)
-        _resolve_deps(op, run, for_stage=True, continue_on_error=continue_on_deps_error)
-        op_util.set_run_staged(run)
-    finally:
-        op_util.clear_run_pending(run)
+    from guild import var
+    with var.index_batch_writes():
+        run = init_run(op)
+        try:
+            _stage_run_proc_env(op, run)
+            _resolve_deps(op, run, for_stage=True, continue_on_error=continue_on_deps_error)
+            op_util.set_run_staged(run)
+        finally:
+            op_util.clear_run_pending(run)
     return run
 
 
@@ -157,14 +159,16 @@ def run(
     extra_env=None,
     continue_on_deps_error=False,
 ):
-    run = init_run(op)
-    op_util.clear_run_marker(run, "STAGED")
-    try:
-        _resolve_deps(op, run, continue_on_error=continue_on_deps_error)
-    finally:
-        op_util.clear_run_pending(run)
-    _callback("run_starting", op, run, pidfile)
-    op_util.set_run_started(run)
+    from guild import var
+    with var.index_batch_writes():
+        run = init_run(op)
+        op_util.clear_run_marker(run, "STAGED")
+        try:
+            _resolve_deps(op, run, continue_on_error=continue_on_deps_error)
+        finally:
+            op_util.clear_run_pending(run)
+        _callback("run_starting", op, run, pidfile)
+        op_util.set_run_running(run)
     if pidfile:
         _run_op_in_background(run, op, pidfile, quiet, stop_after, extra_env)
         return run, None
@@ -372,6 +376,9 @@ def _op_finalize_run_attrs(run, exit_status):
     run.write_attr("exit_status", exit_status)
     run.write_attr("stopped", stopped)
     op_util.delete_proc_lock(run)
+    from guild import var
+    status = "completed" if exit_status == 0 else "error"
+    var.index_update_status(run, status)
 
 
 # =================================================================
