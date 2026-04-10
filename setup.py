@@ -12,22 +12,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import configparser
 import os
 import platform
+import re
 import subprocess
+from email.parser import Parser
 
-from pkg_resources import Distribution as PkgDist
-from pkg_resources import PathMetadata
 from setuptools import find_packages, setup
 from setuptools.command.build_py import build_py
 
-import guild
-
-from guild import log
-
-log.init_logging()
-
 GUILD_DIST_BASENAME = "guildai.dist-info"
+
+
+def _read_version():
+    # Avoid `import guild` — the source tree isn't on sys.path during
+    # PEP 517 isolated builds, and importing guild pulls in runtime
+    # deps that shouldn't be required at build time.
+    with open(os.path.join("guild", "__init__.py"), encoding="utf-8") as f:
+        src = f.read()
+    m = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', src, re.MULTILINE)
+    if not m:
+        raise RuntimeError("could not find __version__ in guild/__init__.py")
+    return m.group(1)
 
 if platform.system() == "Windows":
     NPM_CMD = "npm.cmd"
@@ -36,14 +43,19 @@ else:
 
 
 def guild_dist_info():
-    metadata = PathMetadata(".", GUILD_DIST_BASENAME)
-    dist = PkgDist.from_filename(GUILD_DIST_BASENAME, metadata)
-    assert dist.project_name == "guildai", dist
+    metadata_path = os.path.join(GUILD_DIST_BASENAME, "METADATA")
+    with open(metadata_path, encoding="utf-8") as f:
+        pkg_info = Parser().parse(f)
+    assert pkg_info.get("Name") == "guildai", pkg_info.get("Name")
+    entry_points_path = os.path.join(GUILD_DIST_BASENAME, "entry_points.txt")
+    parser = configparser.ConfigParser()
+    parser.optionxform = str  # preserve case
+    parser.read(entry_points_path, encoding="utf-8")
     entry_points = {
-        group: [str(ep) for ep in eps.values()]
-        for group, eps in dist.get_entry_map().items()
+        group: [f"{name} = {value}" for name, value in parser.items(group)]
+        for group in parser.sections()
     }
-    return dist._parsed_pkg_info, entry_points
+    return pkg_info, entry_points
 
 
 def guild_packages():
@@ -89,7 +101,7 @@ setup(
     cmdclass={"build_py": Build},
     # Attributes from dist-info
     name="guildai",
-    version=guild.__version__,
+    version=_read_version(),
     description=PKG_INFO.get("Summary"),
     install_requires=PKG_INFO.get_all("Requires-Dist"),
     long_description=PKG_INFO.get_payload(),
