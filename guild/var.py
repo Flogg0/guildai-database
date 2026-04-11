@@ -766,16 +766,26 @@ def _run_attr(run, name):
 
 
 def delete_runs(runs, permanent=False):
+    to_remove = []
+    to_register = []  # (run_id, dest) for soft-delete trash index
     for run in runs:
         src = run.dir
         if permanent:
             _delete_run(src)
-            index_remove_run(run.id)
+            to_remove.append(run.id)
         else:
             dest = os.path.join(runs_dir(deleted=True), run.id)
             _move(src, dest)
-            index_remove_run(run.id)
-            index_register_run(runlib.Run(run.id, dest), root=runs_dir(deleted=True))
+            to_remove.append(run.id)
+            to_register.append((run.id, dest))
+    with index_batch_writes():
+        for run_id in to_remove:
+            index_remove_run(run_id)
+    if to_register:
+        trash_root = runs_dir(deleted=True)
+        with index_batch_writes(root=trash_root):
+            for run_id, dest in to_register:
+                index_register_run(runlib.Run(run_id, dest), root=trash_root)
 
 
 def purge_runs(runs):
@@ -808,6 +818,8 @@ def _move_to_backup(path):
 
 
 def restore_runs(runs):
+    to_remove_from_trash = []
+    to_register = []
     for run in runs:
         src = os.path.join(run.dir)
         dest = os.path.join(runs_dir(), run.id)
@@ -815,9 +827,17 @@ def restore_runs(runs):
             log.warning("%s is already restored, skipping", run.id)
             continue
         _move(src, dest)
-        index_remove_run(run.id, runs_dir(deleted=True))
-        restored_run = runlib.Run(run.id, dest)
-        index_register_run(restored_run)
+        to_remove_from_trash.append(run.id)
+        to_register.append(runlib.Run(run.id, dest))
+    if to_remove_from_trash:
+        trash_root = runs_dir(deleted=True)
+        with index_batch_writes(root=trash_root):
+            for run_id in to_remove_from_trash:
+                index_remove_run(run_id, trash_root)
+    if to_register:
+        with index_batch_writes():
+            for restored_run in to_register:
+                index_register_run(restored_run)
 
 
 def find_runs(run_id_prefix, root=None):
