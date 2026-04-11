@@ -158,9 +158,13 @@ class ScalarReader:
         self._db = db
 
     def refresh(self, runs):
+        dirty = False
         for run in runs:
             for path, cur_digest, reader in tfevent.scalar_readers(run.dir):
-                self._maybe_refresh_run_scalars(run, path, cur_digest, reader)
+                if self._maybe_refresh_run_scalars(run, path, cur_digest, reader):
+                    dirty = True
+        if dirty:
+            self._db.commit()
 
     def _maybe_refresh_run_scalars(self, run, path, cur_digest, reader):
         log.debug("Found events in %s (digest %s)", path, cur_digest)
@@ -173,6 +177,8 @@ class ScalarReader:
                 last_digest or 'unset',
             )
             self._refresh_run_scalars(run, prefix, cur_digest, last_digest, reader)
+            return True
+        return False
 
     def _refresh_run_scalars(self, run, prefix, cur_digest, last_digest, reader):
         summarized = _summarize_scalars(reader)
@@ -229,7 +235,6 @@ class ScalarReader:
                     tsum.count,
                 ),
             )
-        self._db.commit()
 
     def _write_source_digest(self, run_id, prefix, path_digest):
         cur = self._db.cursor()
@@ -248,7 +253,6 @@ class ScalarReader:
         """,
             (run_id, prefix, path_digest),
         )
-        self._db.commit()
 
     def read(self, run, prefix, tag, qual, step):
         col_index = self._read_col_index(qual, step)
