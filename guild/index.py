@@ -292,7 +292,7 @@ class ScalarReader:
             """
           SELECT * FROM scalar
           WHERE run = ?
-          ORDER BY 'prefix', 'tag'
+          ORDER BY prefix, tag
         """,
             (run.id,),
         )
@@ -376,7 +376,9 @@ class RunIndex:
     def _init_db(self):
         db_path = self._db_path()
         util.ensure_dir(os.path.dirname(db_path))
-        db = sqlite3.connect(db_path)
+        db = sqlite3.connect(db_path, timeout=300)
+        db.execute("PRAGMA busy_timeout=300000")
+        db.execute("PRAGMA synchronous=NORMAL")
         _init_run_index_tables(db)
         return db
 

@@ -104,6 +104,12 @@ def _init_index_schema(conn):
     conn.commit()
 
 
+def _connect_db(db_path):
+    conn = sqlite3.connect(db_path, timeout=300)
+    conn.execute("PRAGMA busy_timeout=300000")
+    return conn
+
+
 def _get_index_conn(root=None):
     root = root or runs_dir()
     db_path = _index_db_path(root)
@@ -120,16 +126,23 @@ def _get_index_conn(root=None):
     try:
         with _get_index_lock(root):
             try:
-                conn = sqlite3.connect(db_path, timeout=120)
+                conn = _connect_db(db_path)
                 _init_index_schema(conn)
                 conn.execute("SELECT 1 FROM runs LIMIT 1")
+            except sqlite3.OperationalError:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                conn = _connect_db(db_path)
+                _init_index_schema(conn)
             except sqlite3.DatabaseError:
                 try:
                     conn.close()
                 except Exception:
                     pass
                 _nuke_index(root)
-                conn = sqlite3.connect(db_path, timeout=120)
+                conn = _connect_db(db_path)
                 _init_index_schema(conn)
             setattr(_index_local, cache_key, conn)
             try:
@@ -139,7 +152,7 @@ def _get_index_conn(root=None):
                 pass
     except filelock.Timeout:
         log.warning("Timeout acquiring index lock, using unlocked connection")
-        conn = sqlite3.connect(db_path, timeout=120)
+        conn = _connect_db(db_path)
         _init_index_schema(conn)
         setattr(_index_local, cache_key, conn)
     return conn
@@ -151,7 +164,10 @@ def _index_safe_write(fn, root=None):
             fn()
     except filelock.Timeout:
         log.warning("Timeout acquiring index lock")
-    except sqlite3.DatabaseError:
+    except sqlite3.OperationalError as e:
+        log.warning("Index write operational error (transient): %s", e)
+    except sqlite3.DatabaseError as e:
+        log.warning("Index database corruption detected: %s - rebuilding", e)
         _nuke_index(root)
 
 
@@ -410,10 +426,7 @@ def _valref_to_sql(valref):
     col = _ATTR_TO_COL.get(valref)
     if col:
         return col, []
-    # Plain identifier could be a flag, scalar, or other attribute.
-    # Can't safely compile to SQL without ambiguity - fall through to
-    # Python filter path.
-    return None, None
+    return _flag_col(valref), []
 
 
 def _compile_filter_node(node):
@@ -576,7 +589,11 @@ def index_query_runs(root=None, filter_expr=None, base_sql=None,
 
     try:
         rows = conn.execute(sql, params).fetchall()
-    except sqlite3.DatabaseError:
+    except sqlite3.OperationalError as e:
+        log.debug("Index query operational error, falling back to filesystem: %s", e)
+        return None
+    except sqlite3.DatabaseError as e:
+        log.warning("Index database corruption during query: %s - rebuilding", e)
         _nuke_index(root)
         return None
     result = []
