@@ -23,6 +23,8 @@ import sqlite3
 import tempfile
 import threading
 
+import filelock
+
 from guild import config
 from guild import run as runlib
 from guild import util
@@ -41,6 +43,21 @@ def _index_db_path(root=None):
         root_hash = hashlib.md5(root.encode()).hexdigest()[:16]
         return os.path.join(env_dir, f"index_{root_hash}.db")
     return os.path.join(root, ".guild_index.db")
+
+
+_index_locks = {}
+_index_locks_mu = threading.Lock()
+
+
+def _get_index_lock(root=None):
+    db_path = _index_db_path(root)
+    lock_path = db_path + ".lock"
+    with _index_locks_mu:
+        lock = _index_locks.get(lock_path)
+        if lock is None:
+            lock = filelock.FileLock(lock_path, timeout=120)
+            _index_locks[lock_path] = lock
+        return lock
 
 
 def _nuke_index(root=None):
@@ -101,29 +118,39 @@ def _get_index_conn(root=None):
         except sqlite3.DatabaseError:
             _nuke_index(root)
     try:
+        with _get_index_lock(root):
+            try:
+                conn = sqlite3.connect(db_path, timeout=120)
+                _init_index_schema(conn)
+                conn.execute("SELECT 1 FROM runs LIMIT 1")
+            except sqlite3.DatabaseError:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+                _nuke_index(root)
+                conn = sqlite3.connect(db_path, timeout=120)
+                _init_index_schema(conn)
+            setattr(_index_local, cache_key, conn)
+            try:
+                if conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0:
+                    _do_index_sync(conn, root)
+            except sqlite3.OperationalError:
+                pass
+    except filelock.Timeout:
+        log.warning("Timeout acquiring index lock, using unlocked connection")
         conn = sqlite3.connect(db_path, timeout=120)
         _init_index_schema(conn)
-        conn.execute("SELECT 1 FROM runs LIMIT 1")
-    except sqlite3.DatabaseError:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        _nuke_index(root)
-        conn = sqlite3.connect(db_path, timeout=120)
-        _init_index_schema(conn)
-    setattr(_index_local, cache_key, conn)
-    try:
-        if conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0:
-            _do_index_sync(conn, root)
-    except sqlite3.OperationalError:
-        pass
+        setattr(_index_local, cache_key, conn)
     return conn
 
 
 def _index_safe_write(fn, root=None):
     try:
-        fn()
+        with _get_index_lock(root):
+            fn()
+    except filelock.Timeout:
+        log.warning("Timeout acquiring index lock")
     except sqlite3.DatabaseError:
         _nuke_index(root)
 
@@ -561,11 +588,10 @@ def index_query_runs(root=None, filter_expr=None, base_sql=None,
         else:
             stale.append((rid,))
     if stale:
-        try:
+        def _do():
             conn.executemany("DELETE FROM runs WHERE run_id = ?", stale)
             conn.commit()
-        except sqlite3.DatabaseError:
-            pass
+        _index_safe_write(_do, root)
     return result
 
 
@@ -728,10 +754,12 @@ def _iter_dirs(root):
                 else:
                     stale.append((name,))
             if stale:
-                conn.executemany(
-                    "DELETE FROM runs WHERE run_id = ?", stale
-                )
-                conn.commit()
+                def _do():
+                    conn.executemany(
+                        "DELETE FROM runs WHERE run_id = ?", stale
+                    )
+                    conn.commit()
+                _index_safe_write(_do, root)
             return
     except sqlite3.DatabaseError:
         _nuke_index(root)
