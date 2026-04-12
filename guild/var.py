@@ -552,10 +552,21 @@ def index_query_runs(root=None, filter_expr=None, base_sql=None,
     except sqlite3.DatabaseError:
         _nuke_index(root)
         return None
-    return [
-        runlib.Run(rid, os.path.join(root, rid))
-        for (rid,) in rows
-    ]
+    result = []
+    stale = []
+    for (rid,) in rows:
+        path = os.path.join(root, rid)
+        if os.path.exists(path):
+            result.append(runlib.Run(rid, path))
+        else:
+            stale.append((rid,))
+    if stale:
+        try:
+            conn.executemany("DELETE FROM runs WHERE run_id = ?", stale)
+            conn.commit()
+        except sqlite3.DatabaseError:
+            pass
+    return result
 
 
 def path(*names):
@@ -709,9 +720,18 @@ def _iter_dirs(root):
         conn = _get_index_conn(root)
         rows = conn.execute("SELECT run_id FROM runs").fetchall()
         if rows:
+            stale = []
             for (name,) in rows:
                 path = os.path.join(root, name)
-                yield name, path
+                if os.path.exists(path):
+                    yield name, path
+                else:
+                    stale.append((name,))
+            if stale:
+                conn.executemany(
+                    "DELETE FROM runs WHERE run_id = ?", stale
+                )
+                conn.commit()
             return
     except sqlite3.DatabaseError:
         _nuke_index(root)
