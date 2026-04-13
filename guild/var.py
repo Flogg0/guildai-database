@@ -169,8 +169,8 @@ def _should_sync(conn, root):
     """Whether to run a full filesystem sync on this fresh connection.
 
     Skip sync when the marker file exists (another process synced recently).
-    Otherwise sync if the DB is empty but the runs directory has candidates,
-    or if the marker is missing.
+    Otherwise sync only if the DB is empty but the runs directory has candidates.
+    If the DB already has data, trust it and don't re-sync.
     """
     if _sync_marker_exists(root):
         return False
@@ -185,8 +185,7 @@ def _should_sync(conn, root):
                     return True
         except OSError:
             pass
-        return True
-    return True
+    return False
 
 
 def _get_index_conn(root=None):
@@ -227,7 +226,11 @@ def _get_index_conn(root=None):
                 except Exception:
                     pass
 
-    # Slow path: take the lock for init / migration / repair / first sync.
+    # Slow path: take the lock for init / migration / repair.
+    # Sync happens OUTSIDE the lock to avoid blocking writers during a
+    # multi-second filesystem scan.
+    conn = None
+    should_sync = False
     try:
         with _get_index_lock(root):
             conn = None
@@ -259,16 +262,25 @@ def _get_index_conn(root=None):
                 else:
                     raise
             setattr(_index_local, cache_key, conn)
+            # Check if we need to sync, and write the marker INSIDE the lock
+            # so only one process decides to sync. Others will see the marker.
             if _should_sync(conn, root):
-                try:
-                    _do_index_sync(conn, root)
-                except sqlite3.OperationalError as e:
-                    log.debug("Index sync skipped (operational): %s", e)
+                _write_sync_marker(root)
+                should_sync = True
     except filelock.Timeout:
         log.warning(
             "Timeout acquiring index lock; caller will fall back to FS scan"
         )
         raise sqlite3.OperationalError("timeout acquiring index lock")
+
+    # Sync OUTSIDE the lock: this can take several seconds for large runs dirs.
+    if should_sync:
+        try:
+            _do_index_sync(conn, root, add_only=True)
+        except Exception as e:
+            log.warning("Index auto-sync failed, will retry next cold start: %s", e)
+            _remove_sync_marker(root)
+
     return conn
 
 
@@ -356,7 +368,16 @@ def _flush_pending_writes(root=None):
 _SYNC_UPSERT_BATCH = 200
 
 
-def _do_index_sync(conn, root):
+def _do_index_sync(conn, root, add_only=False):
+    """Synchronize index with filesystem.
+
+    When add_only=True (auto-sync from _get_index_conn), only add new runs.
+    Never delete existing entries (in-flight runs may have been registered but
+    not yet have opref written). Stale entries are pruned lazily by query paths.
+
+    When add_only=False (explicit index_sync), do full reconciliation including
+    deletion of truly stale entries.
+    """
     indexed = {row[0] for row in conn.execute("SELECT run_id FROM runs").fetchall()}
     on_disk = set()
     try:
@@ -380,15 +401,17 @@ def _do_index_sync(conn, root):
             run = runlib.Run(name, path)
             _index_upsert_run(conn, run)
         conn.commit()
-    stale = indexed - on_disk
-    if stale:
-        stale_list = [(rid,) for rid in stale]
-        for i in range(0, len(stale_list), _SYNC_UPSERT_BATCH):
-            conn.executemany(
-                "DELETE FROM runs WHERE run_id = ?",
-                stale_list[i:i + _SYNC_UPSERT_BATCH],
-            )
-            conn.commit()
+    # Only delete stale entries when doing full sync, not during auto-sync.
+    if not add_only:
+        stale = indexed - on_disk
+        if stale:
+            stale_list = [(rid,) for rid in stale]
+            for i in range(0, len(stale_list), _SYNC_UPSERT_BATCH):
+                conn.executemany(
+                    "DELETE FROM runs WHERE run_id = ?",
+                    stale_list[i:i + _SYNC_UPSERT_BATCH],
+                )
+                conn.commit()
     _write_sync_marker(root)
 
 
@@ -396,7 +419,7 @@ def index_sync(root=None):
     root = root or runs_dir()
     _remove_sync_marker(root)
     conn = _get_index_conn(root)
-    _index_safe_write(lambda: _do_index_sync(conn, root), root)
+    _index_safe_write(lambda: _do_index_sync(conn, root, add_only=False), root)
 
 
 def _index_upsert_run(conn, run):

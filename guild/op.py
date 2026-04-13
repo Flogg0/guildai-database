@@ -378,7 +378,10 @@ def _op_finalize_run_attrs(run, exit_status):
     op_util.delete_proc_lock(run)
     from guild import var
     status = "completed" if exit_status == 0 else "error"
-    var.index_update_status(run, status)
+    # Batch the finalization writes so all are flushed together.
+    with var.index_batch_writes():
+        var.index_update_status(run, status)
+        var.index_update_attr(run, "started", run.get("started"))
 
 
 # =================================================================

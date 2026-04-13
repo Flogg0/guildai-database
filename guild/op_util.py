@@ -691,7 +691,7 @@ def set_run_started(run):
 
 def set_run_running(run):
     set_run_started(run)
-    var.index_update_status(run, "running")
+    # "running" status is not written to index — not useful and adds NFS write load
 
 
 def set_run_staged(run):
