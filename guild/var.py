@@ -362,7 +362,14 @@ def _flush_pending_writes(root=None):
                     list(updates.values()) + [run_id],
                 )
         conn.commit()
-    _index_safe_write(_do, root)
+    try:
+        _index_safe_write(_do, root)
+    except Exception:
+        if os.getenv("GUILD_OP_TRACE") == "1":
+            import sys, traceback
+            sys.stderr.write("[guild-op-trace] flush: raised\n")
+            traceback.print_exc()
+        raise
 
 
 _SYNC_UPSERT_BATCH = 200

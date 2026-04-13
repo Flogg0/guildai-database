@@ -30,6 +30,13 @@ log = logging.getLogger("guild")
 PROC_TERM_TIMEOUT_SECONDS = 30
 LOG_WAITING_DELAY_SECONDS = 2
 
+
+def _trace(msg):
+    if os.getenv("GUILD_OP_TRACE") == "1":
+        import sys
+        sys.stderr.write(f"[guild-op-trace] {msg}\n")
+        sys.stderr.flush()
+
 ###################################################################
 # Exception classes
 ###################################################################
@@ -160,19 +167,30 @@ def run(
     continue_on_deps_error=False,
 ):
     from guild import var
+    _trace("run: enter")
     with var.index_batch_writes():
+        _trace("run: init_run begin")
         run = init_run(op)
+        _trace(f"run: init_run done id={run.id}")
         op_util.clear_run_marker(run, "STAGED")
         try:
+            _trace("run: resolve_deps begin")
             _resolve_deps(op, run, continue_on_error=continue_on_deps_error)
+            _trace("run: resolve_deps done")
         finally:
             op_util.clear_run_pending(run)
         _callback("run_starting", op, run, pidfile)
+        _trace("run: set_run_running begin")
         op_util.set_run_running(run)
+        _trace("run: set_run_running done")
+    _trace("run: init-batch flushed")
     if pidfile:
+        _trace("run: backgrounding")
         _run_op_in_background(run, op, pidfile, quiet, stop_after, extra_env)
         return run, None
+    _trace("run: _run_op begin")
     exit_status = _run_op(run, op, quiet, stop_after, extra_env)
+    _trace(f"run: _run_op done status={exit_status}")
     _callback("run_stopped", op, run, exit_status)
     return run, exit_status
 
@@ -216,6 +234,7 @@ def _op_start_proc(op, run, quiet, extra_env):
     log.debug("operation command: %s", op.cmd_args)
     if os.getenv("DEBUG_ENV") == "1":
         log.debug("operation env: %s", _hide_secret_env(env))
+    _trace(f"start_proc: cmd={op.cmd_args[0] if op.cmd_args else '?'} cwd={run.dir}")
     stdout, stderr = _proc_streams(quiet)
     try:
         proc = subprocess.Popen(
@@ -226,8 +245,10 @@ def _op_start_proc(op, run, quiet, extra_env):
             stderr=stderr,
         )
     except OSError as e:
+        _trace(f"start_proc: Popen raised {type(e).__name__}: {e}")
         raise ProcessError(e) from e
     else:
+        _trace(f"start_proc: Popen ok pid={proc.pid}")
         op_util.write_proc_lock(proc.pid, run)
         return proc
 
