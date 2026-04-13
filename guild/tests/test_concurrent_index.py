@@ -300,6 +300,121 @@ def test_status_filter_concurrent():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_transient_error_no_nuke():
+    print(f"\n=== Test: Transient DatabaseError does not nuke the index ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        # Seed with a few runs.
+        for i in range(10):
+            run_id = f"{i:032d}"
+            _make_run_dir(runs_dir_path, run_id, status="completed",
+                          flags={"seed": i})
+            run = runlib.Run(run_id, os.path.join(runs_dir_path, run_id))
+            gvar.index_register_run(run, root=runs_dir_path)
+        gvar.index_sync(root=runs_dir_path)
+        db_path = gvar._index_db_path(runs_dir_path)
+        assert os.path.exists(db_path), "DB should exist after sync"
+        size_before = os.path.getsize(db_path)
+
+        # Simulate a transient DatabaseError: the retry path should NOT nuke.
+        call_count = [0]
+        def flaky_write():
+            call_count[0] += 1
+            if call_count[0] == 1:
+                raise sqlite3.DatabaseError("disk I/O error (simulated)")
+            # Second call: real no-op write to prove retry works.
+            conn = gvar._get_index_conn(runs_dir_path)
+            conn.execute("SELECT 1 FROM runs LIMIT 1")
+
+        gvar._index_safe_write(flaky_write, root=runs_dir_path)
+        assert os.path.exists(db_path), "DB should NOT be nuked on transient error"
+        size_after = os.path.getsize(db_path)
+        assert size_after >= size_before, "DB should not shrink"
+        assert call_count[0] == 2, f"Expected 2 calls (retry), got {call_count[0]}"
+
+        # Confirmed corruption SHOULD nuke.
+        def corrupt_write():
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        gvar._index_safe_write(corrupt_write, root=runs_dir_path)
+        assert not os.path.exists(db_path), (
+            "DB SHOULD be nuked on confirmed corruption"
+        )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_filter_speed_10k():
+    print(f"\n=== Test: Filter query speed with 10k runs ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild.filter import parser
+
+    try:
+        N = 10000
+        t0 = time.time()
+        for i in range(N):
+            run_id = f"{i:032x}"
+            _make_run_dir(runs_dir_path, run_id, status="completed",
+                          flags={"n-parallel": i % 5, "seed": i})
+        print(f"  Created {N} runs in {time.time()-t0:.2f}s")
+
+        # Cold sync (first query on empty DB).
+        t0 = time.time()
+        result = gvar.index_query_runs(root=runs_dir_path, filter_expr=None)
+        t_cold = time.time() - t0
+        print(f"  Cold query (full sync): {len(result)} rows in {t_cold:.2f}s")
+        assert len(result) == N, f"Expected {N} rows, got {len(result)}"
+
+        # Warm query (cached conn).
+        fexpr = parser().parse("n-parallel = 3")
+        t0 = time.time()
+        result = gvar.index_query_runs(root=runs_dir_path, filter_expr=fexpr)
+        t_warm = time.time() - t0
+        print(f"  Warm filter query: {len(result)} rows in {t_warm*1000:.1f}ms")
+        assert t_warm < 1.0, f"Warm query too slow: {t_warm:.2f}s (want <1s)"
+        assert len(result) == N // 5, f"Expected {N//5} rows, got {len(result)}"
+
+        # Fresh-process simulation: marker exists, no sync.
+        import threading as _th
+        gvar._index_local = _th.local()
+        t0 = time.time()
+        result = gvar.index_query_runs(root=runs_dir_path, filter_expr=fexpr)
+        t_fresh = time.time() - t0
+        print(f"  Fresh-process filter: {len(result)} rows in {t_fresh*1000:.1f}ms")
+        assert t_fresh < 1.0, (
+            f"Fresh-process query too slow: {t_fresh:.2f}s (want <1s). "
+            "The sync marker may not be preventing full re-sync."
+        )
+
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     mp.set_start_method("fork", force=True)
     results = {}
@@ -307,6 +422,8 @@ if __name__ == "__main__":
     results["concurrent_read_write"] = test_concurrent_read_write()
     results["flag_filter"] = test_flag_filter_concurrent()
     results["status_filter"] = test_status_filter_concurrent()
+    results["transient_error_no_nuke"] = test_transient_error_no_nuke()
+    results["filter_speed_10k"] = test_filter_speed_10k()
 
     print("\n" + "=" * 50)
     print("SUMMARY:")

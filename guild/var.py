@@ -22,6 +22,7 @@ import shutil
 import sqlite3
 import tempfile
 import threading
+import time
 
 import filelock
 
@@ -60,25 +61,66 @@ def _get_index_lock(root=None):
         return lock
 
 
+_CORRUPTION_SIGNALS = (
+    "database disk image is malformed",
+    "file is not a database",
+    "file is encrypted or is not a database",
+    "database is corrupt",
+    "malformed database schema",
+)
+
+
+def _is_corruption_error(exc):
+    msg = str(exc).lower()
+    return any(sig in msg for sig in _CORRUPTION_SIGNALS)
+
+
+def _sync_marker_path(root=None):
+    return _index_db_path(root) + ".synced"
+
+
+def _write_sync_marker(root=None):
+    try:
+        with open(_sync_marker_path(root), "w") as f:
+            f.write(str(int(time.time())))
+    except OSError as e:
+        log.debug("Could not write sync marker: %s", e)
+
+
+def _remove_sync_marker(root=None):
+    try:
+        os.remove(_sync_marker_path(root))
+    except OSError:
+        pass
+
+
+def _sync_marker_exists(root=None):
+    return os.path.exists(_sync_marker_path(root))
+
+
 def _nuke_index(root=None):
+    """Delete the index DB. MUST be called with _get_index_lock held."""
     root = root or runs_dir()
     db_path = _index_db_path(root)
     cache_key = f"conn_{db_path}"
-    conn = getattr(_index_local, cache_key, None)
-    if conn is not None:
-        try:
-            conn.close()
-        except Exception:
-            pass
-        try:
-            delattr(_index_local, cache_key)
-        except AttributeError:
-            pass
-    for suffix in ("", "-wal", "-shm", "-journal"):
-        try:
-            os.remove(db_path + suffix)
-        except OSError:
-            pass
+    # Reentrantly acquire the lock; callers already holding it pay nothing.
+    with _get_index_lock(root):
+        conn = getattr(_index_local, cache_key, None)
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+            try:
+                delattr(_index_local, cache_key)
+            except AttributeError:
+                pass
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                os.remove(db_path + suffix)
+            except OSError:
+                pass
+        _remove_sync_marker(root)
 
 
 def _init_index_schema(conn):
@@ -110,65 +152,167 @@ def _connect_db(db_path):
     return conn
 
 
+def _drop_cached_conn(cache_key):
+    conn = getattr(_index_local, cache_key, None)
+    if conn is not None:
+        try:
+            conn.close()
+        except Exception:
+            pass
+        try:
+            delattr(_index_local, cache_key)
+        except AttributeError:
+            pass
+
+
+def _should_sync(conn, root):
+    """Whether to run a full filesystem sync on this fresh connection.
+
+    Skip sync when the marker file exists (another process synced recently).
+    Otherwise sync if the DB is empty but the runs directory has candidates,
+    or if the marker is missing.
+    """
+    if _sync_marker_exists(root):
+        return False
+    try:
+        count = conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0]
+    except sqlite3.OperationalError:
+        return False
+    if count == 0:
+        try:
+            for name in os.listdir(root):
+                if len(name) == 32:
+                    return True
+        except OSError:
+            pass
+        return True
+    return True
+
+
 def _get_index_conn(root=None):
     root = root or runs_dir()
     db_path = _index_db_path(root)
     cache_key = f"conn_{db_path}"
+
     conn = getattr(_index_local, cache_key, None)
     if conn is not None:
         try:
             conn.execute("SELECT 1 FROM runs LIMIT 1")
             return conn
         except sqlite3.OperationalError:
-            pass
+            _drop_cached_conn(cache_key)
         except sqlite3.DatabaseError:
-            _nuke_index(root)
+            _drop_cached_conn(cache_key)
+
+    # Fast path: DB file already exists and is healthy. Open and probe
+    # without taking the filelock. Most concurrent `guild` invocations
+    # land here and never serialize on the lock.
+    if os.path.exists(db_path):
+        fast_conn = None
+        try:
+            fast_conn = _connect_db(db_path)
+            fast_conn.execute("SELECT 1 FROM runs LIMIT 1")
+            setattr(_index_local, cache_key, fast_conn)
+            return fast_conn
+        except sqlite3.OperationalError:
+            if fast_conn is not None:
+                try:
+                    fast_conn.close()
+                except Exception:
+                    pass
+        except sqlite3.DatabaseError:
+            if fast_conn is not None:
+                try:
+                    fast_conn.close()
+                except Exception:
+                    pass
+
+    # Slow path: take the lock for init / migration / repair / first sync.
     try:
         with _get_index_lock(root):
+            conn = None
             try:
                 conn = _connect_db(db_path)
                 _init_index_schema(conn)
                 conn.execute("SELECT 1 FROM runs LIMIT 1")
             except sqlite3.OperationalError:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
                 conn = _connect_db(db_path)
                 _init_index_schema(conn)
-            except sqlite3.DatabaseError:
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-                _nuke_index(root)
-                conn = _connect_db(db_path)
-                _init_index_schema(conn)
+            except sqlite3.DatabaseError as e:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                if _is_corruption_error(e):
+                    log.warning(
+                        "Index DB corruption confirmed (%s) - rebuilding", e
+                    )
+                    _nuke_index(root)
+                    conn = _connect_db(db_path)
+                    _init_index_schema(conn)
+                else:
+                    raise
             setattr(_index_local, cache_key, conn)
-            try:
-                if conn.execute("SELECT COUNT(*) FROM runs").fetchone()[0] == 0:
+            if _should_sync(conn, root):
+                try:
                     _do_index_sync(conn, root)
-            except sqlite3.OperationalError:
-                pass
+                except sqlite3.OperationalError as e:
+                    log.debug("Index sync skipped (operational): %s", e)
     except filelock.Timeout:
-        log.warning("Timeout acquiring index lock, using unlocked connection")
-        conn = _connect_db(db_path)
-        _init_index_schema(conn)
-        setattr(_index_local, cache_key, conn)
+        log.warning(
+            "Timeout acquiring index lock; caller will fall back to FS scan"
+        )
+        raise sqlite3.OperationalError("timeout acquiring index lock")
     return conn
 
 
 def _index_safe_write(fn, root=None):
+    """Run fn under the index lock, retrying once on transient errors.
+
+    Only rebuilds the index when SQLite reports actual file-level
+    corruption, not on any DatabaseError. This avoids nuke-storms where a
+    single transient failure empties the DB and forces every subsequent
+    process through a full re-sync.
+    """
     try:
         with _get_index_lock(root):
-            fn()
+            try:
+                fn()
+                return
+            except sqlite3.OperationalError as e:
+                log.debug("Index write transient error, retrying: %s", e)
+            except sqlite3.DatabaseError as e:
+                if _is_corruption_error(e):
+                    log.warning(
+                        "Index DB corruption on write (%s) - rebuilding", e
+                    )
+                    _nuke_index(root)
+                    return
+                log.debug("Index write retryable DatabaseError: %s", e)
+            # Drop any cached conn so the retry reopens fresh.
+            _drop_cached_conn(f"conn_{_index_db_path(root)}")
+            try:
+                fn()
+            except sqlite3.DatabaseError as e:
+                if _is_corruption_error(e):
+                    log.warning(
+                        "Index DB corruption confirmed on retry (%s) - "
+                        "rebuilding", e
+                    )
+                    _nuke_index(root)
+                else:
+                    log.warning(
+                        "Index write failed after retry, leaving DB intact: %s",
+                        e,
+                    )
     except filelock.Timeout:
-        log.warning("Timeout acquiring index lock")
-    except sqlite3.OperationalError as e:
-        log.warning("Index write operational error (transient): %s", e)
-    except sqlite3.DatabaseError as e:
-        log.warning("Index database corruption detected: %s - rebuilding", e)
-        _nuke_index(root)
+        log.warning("Timeout acquiring index lock for write")
 
 
 @contextlib.contextmanager
@@ -209,6 +353,9 @@ def _flush_pending_writes(root=None):
     _index_safe_write(_do, root)
 
 
+_SYNC_UPSERT_BATCH = 200
+
+
 def _do_index_sync(conn, root):
     indexed = {row[0] for row in conn.execute("SELECT run_id FROM runs").fetchall()}
     on_disk = set()
@@ -216,6 +363,7 @@ def _do_index_sync(conn, root):
         names = os.listdir(root)
     except OSError:
         names = []
+    new_runs = []
     for name in names:
         if len(name) != 32:
             continue
@@ -224,19 +372,29 @@ def _do_index_sync(conn, root):
             continue
         on_disk.add(name)
         if name not in indexed:
+            new_runs.append((name, path))
+    # Commit in batches so a crash mid-sync doesn't lose all progress and
+    # so other writers aren't blocked by one mega-transaction.
+    for i in range(0, len(new_runs), _SYNC_UPSERT_BATCH):
+        for name, path in new_runs[i:i + _SYNC_UPSERT_BATCH]:
             run = runlib.Run(name, path)
             _index_upsert_run(conn, run)
+        conn.commit()
     stale = indexed - on_disk
     if stale:
-        conn.executemany(
-            "DELETE FROM runs WHERE run_id = ?",
-            [(rid,) for rid in stale],
-        )
-    conn.commit()
+        stale_list = [(rid,) for rid in stale]
+        for i in range(0, len(stale_list), _SYNC_UPSERT_BATCH):
+            conn.executemany(
+                "DELETE FROM runs WHERE run_id = ?",
+                stale_list[i:i + _SYNC_UPSERT_BATCH],
+            )
+            conn.commit()
+    _write_sync_marker(root)
 
 
 def index_sync(root=None):
     root = root or runs_dir()
+    _remove_sync_marker(root)
     conn = _get_index_conn(root)
     _index_safe_write(lambda: _do_index_sync(conn, root), root)
 
@@ -593,20 +751,33 @@ def index_query_runs(root=None, filter_expr=None, base_sql=None,
         log.debug("Index query operational error, falling back to filesystem: %s", e)
         return None
     except sqlite3.DatabaseError as e:
-        log.warning("Index database corruption during query: %s - rebuilding", e)
-        _nuke_index(root)
+        if _is_corruption_error(e):
+            log.warning(
+                "Index DB corruption confirmed during query (%s) - rebuilding",
+                e,
+            )
+            _nuke_index(root)
+            return None
+        log.debug("Index query DatabaseError, falling back to filesystem: %s", e)
         return None
+    if not rows:
+        return []
+    # One listdir to prune stale rows; avoids O(N) stat calls per query.
+    try:
+        on_disk = set(os.listdir(root))
+    except OSError:
+        on_disk = None
     result = []
     stale = []
     for (rid,) in rows:
-        path = os.path.join(root, rid)
-        if os.path.exists(path):
-            result.append(runlib.Run(rid, path))
+        if on_disk is None or rid in on_disk:
+            result.append(runlib.Run(rid, os.path.join(root, rid)))
         else:
             stale.append((rid,))
     if stale:
         def _do():
-            conn.executemany("DELETE FROM runs WHERE run_id = ?", stale)
+            conn.executemany("DELETE FROM runs WHERE run_id = ?",
+                             [(rid,) for rid in stale])
             conn.commit()
         _index_safe_write(_do, root)
     return result
@@ -763,11 +934,14 @@ def _iter_dirs(root):
         conn = _get_index_conn(root)
         rows = conn.execute("SELECT run_id FROM runs").fetchall()
         if rows:
+            try:
+                on_disk = set(os.listdir(root))
+            except OSError:
+                on_disk = None
             stale = []
             for (name,) in rows:
-                path = os.path.join(root, name)
-                if os.path.exists(path):
-                    yield name, path
+                if on_disk is None or name in on_disk:
+                    yield name, os.path.join(root, name)
                 else:
                     stale.append((name,))
             if stale:
@@ -778,8 +952,9 @@ def _iter_dirs(root):
                     conn.commit()
                 _index_safe_write(_do, root)
             return
-    except sqlite3.DatabaseError:
-        _nuke_index(root)
+    except sqlite3.DatabaseError as e:
+        if _is_corruption_error(e):
+            _nuke_index(root)
     except Exception:
         pass
     try:
@@ -922,8 +1097,9 @@ def find_runs(run_id_prefix, root=None):
             (run_id_prefix + "%",),
         ).fetchall()
         return ((rid, os.path.join(root, rid)) for (rid,) in rows)
-    except sqlite3.DatabaseError:
-        _nuke_index(root)
+    except sqlite3.DatabaseError as e:
+        if _is_corruption_error(e):
+            _nuke_index(root)
     except Exception:
         pass
     return (
@@ -941,8 +1117,9 @@ def get_run(run_id, root=None):
         ).fetchone()
         if row:
             return runlib.Run(run_id, os.path.join(root, run_id))
-    except sqlite3.DatabaseError:
-        _nuke_index(root)
+    except sqlite3.DatabaseError as e:
+        if _is_corruption_error(e):
+            _nuke_index(root)
     except Exception:
         pass
     path = os.path.join(root, run_id)
