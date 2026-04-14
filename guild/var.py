@@ -324,7 +324,8 @@ def _index_safe_write(fn, root=None):
                         e,
                     )
     except filelock.Timeout:
-        log.warning("Timeout acquiring index lock for write")
+        log.error("Timeout acquiring index lock for write after 120s")
+        raise
 
 
 @contextlib.contextmanager
@@ -959,6 +960,25 @@ def iter_run_dirs(root=None):
     return _iter_dirs(root or runs_dir())
 
 
+def _fs_only_iter_runs(root):
+    """Pure-FS scan that never touches the index lock.
+
+    Use as the last-resort fallback when a lock timeout has already occurred
+    on the read path; re-entering `_get_index_conn` would just wait on the
+    same contended lock.
+    """
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return
+    for name in names:
+        if len(name) != 32:
+            continue
+        path = os.path.join(root, name)
+        if _opref_exists(path):
+            yield name, path
+
+
 def _iter_dirs(root):
     try:
         conn = _get_index_conn(root)
@@ -1133,7 +1153,7 @@ def find_runs(run_id_prefix, root=None):
     except Exception:
         pass
     return (
-        (name, path) for name, path in _iter_dirs(root)
+        (name, path) for name, path in _fs_only_iter_runs(root)
         if name.startswith(run_id_prefix)
     )
 

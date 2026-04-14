@@ -415,6 +415,134 @@ def test_filter_speed_10k():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _hold_index_lock(runs_dir_path, hold_timeout=30):
+    """Spawn a daemon thread that holds the index filelock. Returns
+    (release_event, thread). Caller sets release_event to let it go.
+    """
+    import filelock as fl
+    import threading
+    from guild import var as gvar
+    lock_path = gvar._index_db_path(runs_dir_path) + ".lock"
+    acquired = threading.Event()
+    release = threading.Event()
+
+    def _hold():
+        lk = fl.FileLock(lock_path, timeout=hold_timeout)
+        with lk:
+            acquired.set()
+            release.wait(timeout=hold_timeout)
+
+    t = threading.Thread(target=_hold, daemon=True)
+    t.start()
+    if not acquired.wait(timeout=10):
+        raise RuntimeError("holder thread failed to acquire lock")
+    return release, t, lock_path
+
+
+def test_find_runs_fs_fallback_under_lock():
+    """Failure A repro: find_runs must locate a run via FS scan when the
+    index lock is held by another process."""
+    print(f"\n=== Test: find_runs FS fallback under held lock ===")
+    import filelock
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        run_id = "a" * 32
+        _make_run_dir(runs_dir_path, run_id, status="completed")
+        run = runlib.Run(run_id, os.path.join(runs_dir_path, run_id))
+        gvar.index_register_run(run, root=runs_dir_path)
+
+        # Drop cached conn AND remove the DB file so find_runs must go through
+        # the slow path (which requires the lock). The run dir stays on disk.
+        db_path = gvar._index_db_path(runs_dir_path)
+        gvar._drop_cached_conn(f"conn_{db_path}")
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                os.remove(db_path + suffix)
+            except OSError:
+                pass
+        # Shrink the cached lock's timeout so the test doesn't wait 120s.
+        lock_path = db_path + ".lock"
+        gvar._index_locks[lock_path] = filelock.FileLock(lock_path, timeout=2)
+
+        release, thread, _ = _hold_index_lock(runs_dir_path)
+        try:
+            t0 = time.time()
+            results = list(gvar.find_runs(run_id, root=runs_dir_path))
+            elapsed = time.time() - t0
+        finally:
+            release.set()
+            thread.join(timeout=5)
+
+        assert results, "find_runs returned no results under held lock"
+        assert results[0][0] == run_id, f"unexpected run_id {results[0][0]}"
+        assert elapsed < 10, f"find_runs took {elapsed:.1f}s; FS fallback should be fast"
+        print(f"  find_runs returned run in {elapsed:.2f}s under held lock")
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_write_raises_on_lock_timeout():
+    """Failure B repro: _index_safe_write must re-raise filelock.Timeout
+    so op finalization propagates a non-zero exit instead of silently
+    ghosting the run."""
+    print(f"\n=== Test: _index_safe_write raises on lock timeout ===")
+    import filelock
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        # Warm the DB so the cached lock entry exists.
+        run_id = "b" * 32
+        _make_run_dir(runs_dir_path, run_id, status="completed")
+        run = runlib.Run(run_id, os.path.join(runs_dir_path, run_id))
+        gvar.index_register_run(run, root=runs_dir_path)
+
+        db_path = gvar._index_db_path(runs_dir_path)
+        lock_path = db_path + ".lock"
+        gvar._index_locks[lock_path] = filelock.FileLock(lock_path, timeout=2)
+
+        release, thread, _ = _hold_index_lock(runs_dir_path)
+        try:
+            raised = False
+            try:
+                gvar._index_safe_write(lambda: None, root=runs_dir_path)
+            except filelock.Timeout:
+                raised = True
+        finally:
+            release.set()
+            thread.join(timeout=5)
+
+        assert raised, "_index_safe_write swallowed filelock.Timeout"
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     mp.set_start_method("fork", force=True)
     results = {}
@@ -424,6 +552,8 @@ if __name__ == "__main__":
     results["status_filter"] = test_status_filter_concurrent()
     results["transient_error_no_nuke"] = test_transient_error_no_nuke()
     results["filter_speed_10k"] = test_filter_speed_10k()
+    results["find_runs_fs_fallback_under_lock"] = test_find_runs_fs_fallback_under_lock()
+    results["write_raises_on_lock_timeout"] = test_write_raises_on_lock_timeout()
 
     print("\n" + "=" * 50)
     print("SUMMARY:")
