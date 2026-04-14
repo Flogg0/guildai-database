@@ -25,6 +25,51 @@ measurable speedups on local disks.
 - Write paths are designed to match upstream cost in the common case, and
   are faster when filtering is involved.
 
+## Worker-mode: `GUILD_NO_INDEX_WRITES`
+
+On heavily-parallel clusters (many concurrent `guild run` processes sharing
+one index over NFS) the index's filelock can starve under load, which
+historically showed up as silent "ghost" runs (a run completes on disk but
+its status is never written to the index).
+
+Set `GUILD_NO_INDEX_WRITES=1` in the environment of a `guild run` invocation
+(e.g. from a slurm sbatch template) to make that process skip all index
+writes. Instead of writing, it `touch`es a dirty marker at
+`<index-db-path>.dirty`. The worker never acquires the index lock.
+
+The next `guild` operation on any host that sees the same index (typically
+`guild runs list`, `guild compare`, `guild view`, …) notices the dirty
+marker, runs a full `index_sync` from the on-disk run directories to bring
+the index up to date, then removes the marker. Result: workers run without
+lock contention, and the index is consistent whenever anyone actually looks
+at it.
+
+Behavioral details:
+
+- Workers with `GUILD_NO_INDEX_WRITES=1` never trigger the dirty-sync on
+  their own reads — only "headnode" (unset env var) invocations do the
+  resync. This avoids thundering-herd syncs when many workers start at
+  once.
+- The dirty marker's freshness is tracked by `mtime`. Clearing is
+  compare-and-delete: if a worker touches the marker while a resync is in
+  progress, the marker survives the clear and the next operation syncs
+  again.
+- Workers can still *read* the index as a cache. Misses fall through to
+  the lock-free filesystem scan in `find_runs`, so `guild run --restart
+  <id>` resolves correctly even when the worker's view of the index is
+  stale.
+- Headnode write paths (e.g. `guild runs delete`, `guild label`) are
+  unchanged; they continue to take the lock and update the index directly.
+  A write-lock timeout now raises loudly instead of being silently
+  swallowed, so failures are visible at process exit.
+
+Known edge case: if the same run is registered by a headnode `guild run`
+(which writes a `pending`/`running` row to the index) and then finalized on
+a worker (which only touches the dirty marker), the dirty-sync sees the run
+ID already present and does not overwrite its status. This does not occur
+in pure worker-only workflows, where the run never enters the index until
+the first resync picks it up from disk in its terminal state.
+
 ---
 
 

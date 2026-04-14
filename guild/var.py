@@ -98,6 +98,54 @@ def _sync_marker_exists(root=None):
     return os.path.exists(_sync_marker_path(root))
 
 
+_NO_INDEX_WRITES_ENV = "GUILD_NO_INDEX_WRITES"
+
+
+def _writes_disabled():
+    return os.environ.get(_NO_INDEX_WRITES_ENV, "") not in ("", "0", "false", "False")
+
+
+def _dirty_marker_path(root=None):
+    return _index_db_path(root) + ".dirty"
+
+
+def _touch_dirty_marker(root=None):
+    path = _dirty_marker_path(root)
+    try:
+        with open(path, "a"):
+            pass
+        os.utime(path, None)
+    except OSError as e:
+        log.debug("Failed to touch index dirty marker at %s: %s", path, e)
+
+
+def _dirty_marker_mtime(root=None):
+    try:
+        return os.path.getmtime(_dirty_marker_path(root))
+    except OSError:
+        return None
+
+
+def _dirty_marker_fresher_than_db(root=None):
+    marker_mtime = _dirty_marker_mtime(root)
+    if marker_mtime is None:
+        return False
+    try:
+        db_mtime = os.path.getmtime(_index_db_path(root))
+    except OSError:
+        return True
+    return marker_mtime > db_mtime
+
+
+def _clear_dirty_marker_if_unchanged(root, seen_mtime):
+    path = _dirty_marker_path(root)
+    try:
+        if os.path.getmtime(path) == seen_mtime:
+            os.remove(path)
+    except OSError:
+        pass
+
+
 def _nuke_index(root=None):
     """Delete the index DB. MUST be called with _get_index_lock held."""
     root = root or runs_dir()
@@ -193,44 +241,61 @@ def _get_index_conn(root=None):
     db_path = _index_db_path(root)
     cache_key = f"conn_{db_path}"
 
-    conn = getattr(_index_local, cache_key, None)
-    if conn is not None:
-        try:
-            conn.execute("SELECT 1 FROM runs LIMIT 1")
-            return conn
-        except sqlite3.OperationalError:
+    # Dirty-triggered full resync. Workers skip this: they read whatever
+    # their view of the shared index shows and rely on the FS fallback in
+    # find_runs for cache misses, so they never touch the write lock.
+    # The in_dirty_sync guard prevents recursive re-sync: _do_index_sync
+    # constructs Run objects whose property access re-enters this function,
+    # and those nested calls must return the cached conn, not start another
+    # sync that would drop the conn we're writing through.
+    dirty_mtime = None
+    if (not _writes_disabled()
+            and not getattr(_index_local, 'in_dirty_sync', False)):
+        dirty_mtime = _dirty_marker_mtime(root)
+        if dirty_mtime is not None and _dirty_marker_fresher_than_db(root):
             _drop_cached_conn(cache_key)
-        except sqlite3.DatabaseError:
-            _drop_cached_conn(cache_key)
+        else:
+            dirty_mtime = None
 
-    # Fast path: DB file already exists and is healthy. Open and probe
-    # without taking the filelock. Most concurrent `guild` invocations
-    # land here and never serialize on the lock.
-    if os.path.exists(db_path):
-        fast_conn = None
-        try:
-            fast_conn = _connect_db(db_path)
-            fast_conn.execute("SELECT 1 FROM runs LIMIT 1")
-            setattr(_index_local, cache_key, fast_conn)
-            return fast_conn
-        except sqlite3.OperationalError:
-            if fast_conn is not None:
-                try:
-                    fast_conn.close()
-                except Exception:
-                    pass
-        except sqlite3.DatabaseError:
-            if fast_conn is not None:
-                try:
-                    fast_conn.close()
-                except Exception:
-                    pass
+    if dirty_mtime is None:
+        conn = getattr(_index_local, cache_key, None)
+        if conn is not None:
+            try:
+                conn.execute("SELECT 1 FROM runs LIMIT 1")
+                return conn
+            except sqlite3.OperationalError:
+                _drop_cached_conn(cache_key)
+            except sqlite3.DatabaseError:
+                _drop_cached_conn(cache_key)
+
+        # Fast path: DB file already exists and is healthy. Open and probe
+        # without taking the filelock. Most concurrent `guild` invocations
+        # land here and never serialize on the lock.
+        if os.path.exists(db_path):
+            fast_conn = None
+            try:
+                fast_conn = _connect_db(db_path)
+                fast_conn.execute("SELECT 1 FROM runs LIMIT 1")
+                setattr(_index_local, cache_key, fast_conn)
+                return fast_conn
+            except sqlite3.OperationalError:
+                if fast_conn is not None:
+                    try:
+                        fast_conn.close()
+                    except Exception:
+                        pass
+            except sqlite3.DatabaseError:
+                if fast_conn is not None:
+                    try:
+                        fast_conn.close()
+                    except Exception:
+                        pass
 
     # Slow path: take the lock for init / migration / repair.
     # Sync happens OUTSIDE the lock to avoid blocking writers during a
     # multi-second filesystem scan.
     conn = None
-    should_sync = False
+    sync_kind = None  # None | 'add_only' | 'full'
     try:
         with _get_index_lock(root):
             conn = None
@@ -262,11 +327,11 @@ def _get_index_conn(root=None):
                 else:
                     raise
             setattr(_index_local, cache_key, conn)
-            # Check if we need to sync, and write the marker INSIDE the lock
-            # so only one process decides to sync. Others will see the marker.
-            if _should_sync(conn, root):
+            if dirty_mtime is not None:
+                sync_kind = 'full'
+            elif _should_sync(conn, root):
                 _write_sync_marker(root)
-                should_sync = True
+                sync_kind = 'add_only'
     except filelock.Timeout:
         log.warning(
             "Timeout acquiring index lock; caller will fall back to FS scan"
@@ -274,7 +339,16 @@ def _get_index_conn(root=None):
         raise sqlite3.OperationalError("timeout acquiring index lock")
 
     # Sync OUTSIDE the lock: this can take several seconds for large runs dirs.
-    if should_sync:
+    if sync_kind == 'full':
+        _index_local.in_dirty_sync = True
+        try:
+            _do_index_sync(conn, root, add_only=False)
+            _clear_dirty_marker_if_unchanged(root, dirty_mtime)
+        except Exception as e:
+            log.warning("Dirty-triggered index sync failed: %s", e)
+        finally:
+            _index_local.in_dirty_sync = False
+    elif sync_kind == 'add_only':
         try:
             _do_index_sync(conn, root, add_only=True)
         except Exception as e:
@@ -292,6 +366,9 @@ def _index_safe_write(fn, root=None):
     single transient failure empties the DB and forces every subsequent
     process through a full re-sync.
     """
+    if _writes_disabled():
+        _touch_dirty_marker(root)
+        return
     try:
         with _get_index_lock(root):
             try:
@@ -330,6 +407,12 @@ def _index_safe_write(fn, root=None):
 
 @contextlib.contextmanager
 def index_batch_writes(root=None):
+    if _writes_disabled():
+        try:
+            yield
+        finally:
+            _touch_dirty_marker(root)
+        return
     depth = getattr(_index_local, 'batch_depth', 0)
     if depth == 0:
         _index_local.pending_writes = {}
@@ -344,6 +427,9 @@ def index_batch_writes(root=None):
 
 
 def _flush_pending_writes(root=None):
+    if _writes_disabled():
+        _touch_dirty_marker(root)
+        return
     pending = getattr(_index_local, 'pending_writes', None)
     if not pending:
         return

@@ -543,6 +543,273 @@ def test_write_raises_on_lock_timeout():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_worker_writes_are_noops_and_no_lock():
+    """With GUILD_NO_INDEX_WRITES=1, every write path must be a no-op
+    that only touches the dirty marker. Proved by holding the lock
+    externally: if any write tried to acquire it, the call would block
+    until the short timeout and raise filelock.Timeout."""
+    print(f"\n=== Test: worker writes are no-ops and never touch the lock ===")
+    import filelock
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        # Seed the DB so the lock file exists and can be held.
+        seed_id = "0" * 32
+        _make_run_dir(runs_dir_path, seed_id, status="completed")
+        seed = runlib.Run(seed_id, os.path.join(runs_dir_path, seed_id))
+        gvar.index_register_run(seed, root=runs_dir_path)
+
+        db_path = gvar._index_db_path(runs_dir_path)
+        marker_path = db_path + ".dirty"
+        db_mtime_before = os.path.getmtime(db_path)
+
+        # Shrink the cached lock's timeout so if worker mode does leak a
+        # lock acquisition, we fail in seconds instead of 120s.
+        lock_path = db_path + ".lock"
+        gvar._index_locks[lock_path] = filelock.FileLock(lock_path, timeout=2)
+
+        os.environ[gvar._NO_INDEX_WRITES_ENV] = "1"
+
+        release, thread, _ = _hold_index_lock(runs_dir_path)
+        try:
+            run_id = "w" * 32
+            _make_run_dir(runs_dir_path, run_id, status="completed")
+            run = runlib.Run(run_id, os.path.join(runs_dir_path, run_id))
+
+            t0 = time.time()
+            gvar.index_register_run(run, root=runs_dir_path)
+            gvar.index_update_status(run, "pending", root=runs_dir_path)
+            with gvar.index_batch_writes(root=runs_dir_path):
+                gvar.index_update_status(run, "completed", root=runs_dir_path)
+                gvar.index_update_attr(run, "started", int(time.time()),
+                                       root=runs_dir_path)
+            elapsed = time.time() - t0
+        finally:
+            release.set()
+            thread.join(timeout=5)
+            os.environ.pop(gvar._NO_INDEX_WRITES_ENV, None)
+
+        assert elapsed < 1.0, (
+            f"Worker writes took {elapsed:.2f}s; they must not wait on the lock"
+        )
+        assert os.path.exists(marker_path), "dirty marker not created"
+        marker_mtime = os.path.getmtime(marker_path)
+        # Clock resolution can make marker_mtime == db_mtime_before on the
+        # same second; the important invariant is that the marker is not
+        # older than the DB — a later non-worker op will see fresh-or-equal
+        # and can still run the sync on the next strictly-fresher bump.
+        assert marker_mtime >= db_mtime_before, (
+            f"marker mtime ({marker_mtime}) older than db ({db_mtime_before})"
+        )
+        # DB unchanged: only the seeded run is there; the worker run is not.
+        conn = sqlite3.connect(db_path)
+        try:
+            rows = conn.execute("SELECT run_id FROM runs").fetchall()
+        finally:
+            conn.close()
+        run_ids = {r[0] for r in rows}
+        assert run_id not in run_ids, (
+            f"worker write leaked into DB: {run_ids}"
+        )
+        assert seed_id in run_ids, "seeded run missing from DB"
+
+        print(f"  worker writes: {elapsed*1000:.1f}ms under held lock")
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        os.environ.pop("GUILD_NO_INDEX_WRITES", None)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_next_op_syncs_on_dirty():
+    """After a worker touches the dirty marker, the next non-worker
+    _get_index_conn must run a full sync and then clear the marker."""
+    print(f"\n=== Test: next op syncs on dirty marker ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        # Seed with run A via the normal write path.
+        a_id = "a" * 32
+        _make_run_dir(runs_dir_path, a_id, status="completed")
+        a = runlib.Run(a_id, os.path.join(runs_dir_path, a_id))
+        gvar.index_register_run(a, root=runs_dir_path)
+        gvar.index_update_status(a, "completed", root=runs_dir_path)
+
+        # Create run B on disk but NOT in the index (simulates a worker run).
+        b_id = "b" * 32
+        _make_run_dir(runs_dir_path, b_id, status="completed")
+
+        db_path = gvar._index_db_path(runs_dir_path)
+        marker_path = db_path + ".dirty"
+
+        # Touch the marker with an mtime strictly greater than the DB.
+        with open(marker_path, "a"):
+            pass
+        future = os.path.getmtime(db_path) + 5
+        os.utime(marker_path, (future, future))
+
+        # Drop cached conn to simulate a fresh CLI process.
+        gvar._drop_cached_conn(f"conn_{db_path}")
+        gvar._remove_sync_marker(runs_dir_path)
+
+        results = list(gvar.find_runs("", root=runs_dir_path))
+        ids = {rid for rid, _ in results}
+
+        assert b_id in ids, f"dirty sync did not pick up B: {ids}"
+        assert a_id in ids, f"dirty sync dropped A: {ids}"
+        assert not os.path.exists(marker_path), (
+            "dirty marker should be cleared after successful sync"
+        )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_racing_touch_preserves_marker():
+    """If a worker touches the marker during a running sync, the
+    compare-and-delete must leave the marker in place so the next op
+    re-syncs."""
+    print(f"\n=== Test: racing touch preserves dirty marker ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        seed_id = "c" * 32
+        _make_run_dir(runs_dir_path, seed_id, status="completed")
+        seed = runlib.Run(seed_id, os.path.join(runs_dir_path, seed_id))
+        gvar.index_register_run(seed, root=runs_dir_path)
+
+        db_path = gvar._index_db_path(runs_dir_path)
+        marker_path = db_path + ".dirty"
+
+        # Make the marker fresher than the DB.
+        with open(marker_path, "a"):
+            pass
+        future = os.path.getmtime(db_path) + 5
+        os.utime(marker_path, (future, future))
+
+        # Monkey-patch _do_index_sync to race: bump the marker mid-sync.
+        original = gvar._do_index_sync
+        def racing_sync(conn, root, add_only=False):
+            racing_sync.called += 1
+            try:
+                original(conn, root, add_only=add_only)
+            finally:
+                future2 = os.path.getmtime(marker_path) + 10
+                os.utime(marker_path, (future2, future2))
+        racing_sync.called = 0
+        gvar._do_index_sync = racing_sync
+
+        try:
+            gvar._drop_cached_conn(f"conn_{db_path}")
+            gvar._remove_sync_marker(runs_dir_path)
+            list(gvar.find_runs("", root=runs_dir_path))
+        finally:
+            gvar._do_index_sync = original
+
+        assert racing_sync.called == 1, (
+            f"sync should have run exactly once, ran {racing_sync.called}"
+        )
+        assert os.path.exists(marker_path), (
+            "racing touch should have prevented marker cleanup"
+        )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_worker_reads_never_trigger_sync():
+    """With GUILD_NO_INDEX_WRITES=1, reads must never invoke _do_index_sync
+    even when the dirty marker is fresh, to avoid thundering-herd syncs
+    and any worker acquiring the write lock."""
+    print(f"\n=== Test: worker reads never trigger sync ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        run_id = "d" * 32
+        _make_run_dir(runs_dir_path, run_id, status="completed")
+        run = runlib.Run(run_id, os.path.join(runs_dir_path, run_id))
+        gvar.index_register_run(run, root=runs_dir_path)
+
+        db_path = gvar._index_db_path(runs_dir_path)
+        marker_path = db_path + ".dirty"
+
+        with open(marker_path, "a"):
+            pass
+        future = os.path.getmtime(db_path) + 5
+        os.utime(marker_path, (future, future))
+
+        sync_calls = []
+        original = gvar._do_index_sync
+        def counting_sync(*a, **kw):
+            sync_calls.append(1)
+            return original(*a, **kw)
+        gvar._do_index_sync = counting_sync
+
+        os.environ[gvar._NO_INDEX_WRITES_ENV] = "1"
+        try:
+            gvar._drop_cached_conn(f"conn_{db_path}")
+            list(gvar.find_runs(run_id, root=runs_dir_path))
+        finally:
+            gvar._do_index_sync = original
+            os.environ.pop(gvar._NO_INDEX_WRITES_ENV, None)
+
+        assert not sync_calls, (
+            f"worker read invoked sync {len(sync_calls)} times; must be 0"
+        )
+        assert os.path.exists(marker_path), "worker must not clear marker"
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        os.environ.pop("GUILD_NO_INDEX_WRITES", None)
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     mp.set_start_method("fork", force=True)
     results = {}
@@ -554,6 +821,10 @@ if __name__ == "__main__":
     results["filter_speed_10k"] = test_filter_speed_10k()
     results["find_runs_fs_fallback_under_lock"] = test_find_runs_fs_fallback_under_lock()
     results["write_raises_on_lock_timeout"] = test_write_raises_on_lock_timeout()
+    results["worker_writes_are_noops"] = test_worker_writes_are_noops_and_no_lock()
+    results["next_op_syncs_on_dirty"] = test_next_op_syncs_on_dirty()
+    results["racing_touch_preserves_marker"] = test_racing_touch_preserves_marker()
+    results["worker_reads_never_trigger_sync"] = test_worker_reads_never_trigger_sync()
 
     print("\n" + "=" * 50)
     print("SUMMARY:")
