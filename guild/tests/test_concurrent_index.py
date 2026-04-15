@@ -545,9 +545,9 @@ def test_write_raises_on_lock_timeout():
 
 def test_worker_writes_are_noops_and_no_lock():
     """With GUILD_NO_INDEX_WRITES=1, every write path must be a no-op
-    that only touches the dirty marker. Proved by holding the lock
-    externally: if any write tried to acquire it, the call would block
-    until the short timeout and raise filelock.Timeout."""
+    that only touches the per-run dirty marker. Proved by holding the
+    lock externally: if any write tried to acquire it, the call would
+    block until the short timeout and raise filelock.Timeout."""
     print(f"\n=== Test: worker writes are no-ops and never touch the lock ===")
     import filelock
     tmpdir = tempfile.mkdtemp(prefix="guild_test_")
@@ -568,7 +568,8 @@ def test_worker_writes_are_noops_and_no_lock():
         gvar.index_register_run(seed, root=runs_dir_path)
 
         db_path = gvar._index_db_path(runs_dir_path)
-        marker_path = db_path + ".dirty"
+        global_marker_path = db_path + ".dirty"
+        per_run_dir = db_path + ".dirty.d"
         db_mtime_before = os.path.getmtime(db_path)
 
         # Shrink the cached lock's timeout so if worker mode does leak a
@@ -600,14 +601,24 @@ def test_worker_writes_are_noops_and_no_lock():
         assert elapsed < 1.0, (
             f"Worker writes took {elapsed:.2f}s; they must not wait on the lock"
         )
-        assert os.path.exists(marker_path), "dirty marker not created"
-        marker_mtime = os.path.getmtime(marker_path)
-        # Clock resolution can make marker_mtime == db_mtime_before on the
-        # same second; the important invariant is that the marker is not
-        # older than the DB — a later non-worker op will see fresh-or-equal
-        # and can still run the sync on the next strictly-fresher bump.
+        # Per-run marker must exist for the worker's run; global marker
+        # should NOT be touched (we want delta sync, not full resync).
+        per_run_marker = os.path.join(per_run_dir, run_id)
+        assert os.path.exists(per_run_marker), (
+            f"per-run dirty marker not created at {per_run_marker}"
+        )
+        assert not os.path.exists(global_marker_path), (
+            "global dirty marker was touched by worker writes — this forces "
+            "full resync and defeats the per-run granularity"
+        )
+        marker_mtime = os.path.getmtime(per_run_marker)
         assert marker_mtime >= db_mtime_before, (
             f"marker mtime ({marker_mtime}) older than db ({db_mtime_before})"
+        )
+        # Seed run should NOT have a per-run marker — only the worker's run.
+        other_markers = [n for n in os.listdir(per_run_dir) if n != run_id]
+        assert not other_markers, (
+            f"unrelated per-run markers created: {other_markers}"
         )
         # DB unchanged: only the seeded run is there; the worker run is not.
         conn = sqlite3.connect(db_path)
@@ -1046,6 +1057,304 @@ def test_dirty_flag_during_run_updates_on_finalize():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def _make_run_with_op(root, run_id, op_name, model_name="", flags=None,
+                      status="completed"):
+    """Like _make_run_dir but writes a parseable opref so format_operation
+    returns 'model_name:op_name' (or just op_name when model_name is empty)."""
+    run_path = os.path.join(root, run_id)
+    guild_dir = os.path.join(run_path, ".guild")
+    attrs_dir = os.path.join(guild_dir, "attrs")
+    os.makedirs(attrs_dir, exist_ok=True)
+    # Encoded opref format: PKG_TYPE:PKG_NAME PKG_VER MODEL_NAME OP_NAME
+    # shlex_split parses 4 tokens; '' becomes an empty token.
+    pkg_ver = "''"
+    model = model_name if model_name else "''"
+    with open(os.path.join(guild_dir, "opref"), "w") as f:
+        f.write(f"guildfile:test {pkg_ver} {model} {op_name}")
+    ts = str(int(time.time() * 1000000))
+    with open(os.path.join(attrs_dir, "initialized"), "w") as f:
+        f.write(ts)
+    with open(os.path.join(attrs_dir, "started"), "w") as f:
+        f.write(ts)
+    if flags:
+        with open(os.path.join(attrs_dir, "flags"), "w") as f:
+            json.dump(flags, f)
+    if status == "completed":
+        with open(os.path.join(attrs_dir, "exit_status"), "w") as f:
+            f.write("0")
+
+
+def test_operation_filter_via_index():
+    """`--filter operation=X` must match runs whose op_name matches X.
+    Before the fix, _valref_to_sql treats 'operation' as a flag name and
+    compiles to json_extract(flags,'$.operation')=X, which is always false."""
+    print(f"\n=== Test: operation= filter is served correctly by the index ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+    from guild import filter as filterlib
+
+    try:
+        match_id = "a" * 32
+        miss_id = "b" * 32
+        _make_run_with_op(runs_dir_path, match_id, "rollout", "planners")
+        _make_run_with_op(runs_dir_path, miss_id, "train", "planners")
+        for rid in (match_id, miss_id):
+            run = runlib.Run(rid, os.path.join(runs_dir_path, rid))
+            gvar.index_register_run(run, root=runs_dir_path)
+            gvar.index_update_status(run, "completed", root=runs_dir_path)
+
+        filter_expr = filterlib.parser().parse("operation=planners:rollout")
+        result = gvar.index_query_runs(
+            root=runs_dir_path, filter_expr=filter_expr,
+        )
+
+        assert result is not None, (
+            "index must serve operation= filter, not return None"
+        )
+        ids = {r.id for r in result}
+        assert ids == {match_id}, (
+            f"expected only the matching run; got {ids}"
+        )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_operation_and_flag_compound_filter():
+    """Compound filter `operation=X and flag=Y` must intersect correctly."""
+    print(f"\n=== Test: compound filter operation=X and flag=Y ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+    from guild import filter as filterlib
+
+    try:
+        # A: match (op + flag).  B: matches op only.  C: matches flag only.
+        a_id, b_id, c_id = ("a" * 32, "b" * 32, "c" * 32)
+        _make_run_with_op(runs_dir_path, a_id, "rollout", "planners",
+                          flags={"n-parallel": 1})
+        _make_run_with_op(runs_dir_path, b_id, "rollout", "planners",
+                          flags={"n-parallel": 4})
+        _make_run_with_op(runs_dir_path, c_id, "train", "planners",
+                          flags={"n-parallel": 1})
+        for rid in (a_id, b_id, c_id):
+            run = runlib.Run(rid, os.path.join(runs_dir_path, rid))
+            gvar.index_register_run(run, root=runs_dir_path)
+            gvar.index_update_status(run, "completed", root=runs_dir_path)
+            gvar.index_update_attr(run, "flags", run.get("flags"),
+                                   root=runs_dir_path)
+
+        filter_expr = filterlib.parser().parse(
+            "operation=planners:rollout and n-parallel=1"
+        )
+        result = gvar.index_query_runs(
+            root=runs_dir_path, filter_expr=filter_expr,
+        )
+        assert result is not None, "index must serve the compound filter"
+        ids = {r.id for r in result}
+        assert ids == {a_id}, (
+            f"expected only A (matching both); got {ids}"
+        )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_unindexable_core_attr_falls_back():
+    """`op=X` (and other computed core attrs without a matching column)
+    must force index_query_runs to return None so filtered_runs takes
+    the FS path. Without this, the filter compiles to a wrong JSON-extract
+    on flags and silently returns empty."""
+    print(f"\n=== Test: unindexable core attr forces FS fallback ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+    from guild import filter as filterlib
+
+    try:
+        run_id = "d" * 32
+        _make_run_with_op(runs_dir_path, run_id, "rollout", "planners")
+        run = runlib.Run(run_id, os.path.join(runs_dir_path, run_id))
+        gvar.index_register_run(run, root=runs_dir_path)
+
+        for term in ("op=rollout", "op_model=planners", "from=foo"):
+            filter_expr = filterlib.parser().parse(term)
+            result = gvar.index_query_runs(
+                root=runs_dir_path, filter_expr=filter_expr,
+            )
+            assert result is None, (
+                f"filter {term!r} must return None to force FS fallback;"
+                f" got {result}"
+            )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_per_run_marker_triggers_delta_sync():
+    """A per-run marker must drive a delta sync: only the marked run is
+    re-read from disk; unmarked runs keep their existing rows."""
+    print(f"\n=== Test: per-run marker triggers delta sync ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        # Seed two completed runs via the headnode path.
+        a_id = "a" * 32
+        b_id = "b" * 32
+        _make_run_dir(runs_dir_path, a_id, status="completed")
+        _make_run_dir(runs_dir_path, b_id, status="completed")
+        a = runlib.Run(a_id, os.path.join(runs_dir_path, a_id))
+        b = runlib.Run(b_id, os.path.join(runs_dir_path, b_id))
+        gvar.index_register_run(a, root=runs_dir_path)
+        gvar.index_update_status(a, "completed", root=runs_dir_path)
+        gvar.index_register_run(b, root=runs_dir_path)
+        gvar.index_update_status(b, "completed", root=runs_dir_path)
+
+        db_path = gvar._index_db_path(runs_dir_path)
+
+        # Simulate a worker finalizing run A: bump its disk attrs and
+        # touch only A's per-run marker. Run B is untouched on disk and
+        # in the index.
+        a_attrs = os.path.join(runs_dir_path, a_id, ".guild", "attrs")
+        with open(os.path.join(a_attrs, "label"), "w") as f:
+            f.write("delta-synced\n")
+
+        time.sleep(1.1)  # ensure marker mtime > db mtime at second resolution
+        gvar._touch_run_dirty_marker(runs_dir_path, a_id)
+
+        # Drop cached conn so the next read reopens and goes through
+        # dirty detection.
+        cache_key = f"conn_{db_path}"
+        gvar._drop_cached_conn(cache_key)
+
+        conn = gvar._get_index_conn(runs_dir_path)
+        row_a = conn.execute(
+            "SELECT label FROM runs WHERE run_id = ?", (a_id,)
+        ).fetchone()
+        row_b = conn.execute(
+            "SELECT label FROM runs WHERE run_id = ?", (b_id,)
+        ).fetchone()
+        assert row_a is not None and row_a[0] == "delta-synced", (
+            f"delta sync failed to pick up run A's new label: {row_a}"
+        )
+        # B's row must still exist (not deleted, not changed).
+        assert row_b is not None, "run B was dropped by delta sync"
+
+        # The per-run marker for A must be cleared after a clean sync.
+        a_marker = os.path.join(db_path + ".dirty.d", a_id)
+        assert not os.path.exists(a_marker), (
+            f"per-run marker for A not cleared after delta sync: {a_marker}"
+        )
+        # Global marker must NOT have been touched.
+        assert not os.path.exists(db_path + ".dirty"), (
+            "global dirty marker touched during delta sync"
+        )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_per_run_marker_survives_in_flight():
+    """If a per-run marker exists for a run with no definitive on-disk
+    status (no exit_status, no STAGED/PENDING/LOCK.remote), delta sync
+    must leave the marker in place so the next read retries."""
+    print(f"\n=== Test: per-run marker survives for in-flight run ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        # Run with no exit_status and no marker files = "in-flight on
+        # another host" from this host's point of view.
+        run_id = "c" * 32
+        run_path = os.path.join(runs_dir_path, run_id)
+        guild_dir = os.path.join(run_path, ".guild")
+        attrs_dir = os.path.join(guild_dir, "attrs")
+        os.makedirs(attrs_dir, exist_ok=True)
+        with open(os.path.join(guild_dir, "opref"), "w") as f:
+            f.write("test:test")
+        ts = str(int(time.time() * 1000000))
+        with open(os.path.join(attrs_dir, "initialized"), "w") as f:
+            f.write(ts)
+        # intentionally no exit_status / STAGED / PENDING / LOCK.remote
+
+        # Register it with pending status (headnode-side).
+        run = runlib.Run(run_id, run_path)
+        gvar.index_register_run(run, root=runs_dir_path)
+        gvar.index_update_status(run, "pending", root=runs_dir_path)
+
+        db_path = gvar._index_db_path(runs_dir_path)
+
+        time.sleep(1.1)
+        gvar._touch_run_dirty_marker(runs_dir_path, run_id)
+
+        cache_key = f"conn_{db_path}"
+        gvar._drop_cached_conn(cache_key)
+        gvar._get_index_conn(runs_dir_path)
+
+        marker_path = os.path.join(db_path + ".dirty.d", run_id)
+        assert os.path.exists(marker_path), (
+            "per-run marker cleared for in-flight run — it must survive "
+            "so the next sync retries after exit_status is written"
+        )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     mp.set_start_method("fork", force=True)
     results = {}
@@ -1063,6 +1372,11 @@ if __name__ == "__main__":
     results["worker_reads_never_trigger_sync"] = test_worker_reads_never_trigger_sync()
     results["dirty_sync_refreshes_existing_row_status"] = test_dirty_sync_refreshes_existing_row_status()
     results["dirty_flag_during_run_updates_on_finalize"] = test_dirty_flag_during_run_updates_on_finalize()
+    results["operation_filter_via_index"] = test_operation_filter_via_index()
+    results["operation_and_flag_compound_filter"] = test_operation_and_flag_compound_filter()
+    results["unindexable_core_attr_falls_back"] = test_unindexable_core_attr_falls_back()
+    results["per_run_marker_triggers_delta_sync"] = test_per_run_marker_triggers_delta_sync()
+    results["per_run_marker_survives_in_flight"] = test_per_run_marker_survives_in_flight()
 
     print("\n" + "=" * 50)
     print("SUMMARY:")

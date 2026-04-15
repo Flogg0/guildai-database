@@ -34,15 +34,22 @@ its status is never written to the index).
 
 Set `GUILD_NO_INDEX_WRITES=1` in the environment of a `guild run` invocation
 (e.g. from a slurm sbatch template) to make that process skip all index
-writes. Instead of writing, it `touch`es a dirty marker at
-`<index-db-path>.dirty`. The worker never acquires the index lock.
+writes. Instead of writing, it `touch`es a per-run dirty marker at
+`<index-db-path>.dirty.d/<run_id>`. The worker never acquires the index lock.
 
 The next `guild` operation on any host that sees the same index (typically
-`guild runs list`, `guild compare`, `guild view`, …) notices the dirty
-marker, runs a full `index_sync` from the on-disk run directories to bring
-the index up to date, then removes the marker. Result: workers run without
-lock contention, and the index is consistent whenever anyone actually looks
-at it.
+`guild runs list`, `guild compare`, `guild view`, …) lists the per-run
+marker directory and runs a **delta sync**: only the marked runs are
+re-read from disk and upserted into the index, then their markers are
+cleared. Result: workers run without lock contention, and the cost of the
+reconciling read scales with the number of *changed* runs, not the total
+number of runs in the store.
+
+A global marker at `<index-db-path>.dirty` is still honored as an escape
+hatch: if it is fresher than the DB file, the next read runs a full
+`index_sync` instead of a delta sync. Workers no longer touch the global
+marker themselves; it is only set by admin intervention or by legacy code
+paths.
 
 Behavioral details:
 
@@ -50,10 +57,13 @@ Behavioral details:
   their own reads — only "headnode" (unset env var) invocations do the
   resync. This avoids thundering-herd syncs when many workers start at
   once.
-- The dirty marker's freshness is tracked by `mtime`. Clearing is
-  compare-and-delete: if a worker touches the marker while a resync is in
-  progress, the marker survives the clear and the next operation syncs
-  again.
+- Per-run marker freshness is tracked by `mtime`, compared against the DB
+  file's mtime. Clearing is compare-and-delete: if a worker re-touches a
+  marker while a resync is in progress, the marker survives the clear and
+  the next operation syncs again.
+- A full sync also clears per-run markers whose `mtime` is older than the
+  sync started, so a full resync followed by a delta read doesn't
+  redundantly re-upsert runs the full sync already covered.
 - Workers can still *read* the index as a cache. Misses fall through to
   the lock-free filesystem scan in `find_runs`, so `guild run --restart
   <id>` resolves correctly even when the worker's view of the index is
@@ -63,16 +73,17 @@ Behavioral details:
   A write-lock timeout now raises loudly instead of being silently
   swallowed, so failures are visible at process exit.
 
-The dirty-triggered resync re-upserts every on-disk run (not just new
-ones), so a run that was registered on the headnode as `pending` and then
-finalized on a worker lands with its terminal status on the next headnode
-read. During the sync, cached index rows are bypassed so `Run` properties
-are recomputed from the filesystem.
+Both delta and full resyncs upsert affected runs from disk (not just
+inserts), so a run that was registered on the headnode as `pending` and
+then finalized on a worker lands with its terminal status on the next
+headnode read. During the sync, cached index rows are bypassed so `Run`
+properties are recomputed from the filesystem.
 
 In-flight runs (no `exit_status` yet, no `STAGED`/`PENDING`/`LOCK.remote`
 marker) are skipped by the resync: on another NFS host their status would
-degrade to `error` via a local-PID check. They are picked up on the next
-sync after the worker writes `exit_status`.
+degrade to `error` via a local-PID check. The per-run marker for an
+in-flight run is left in place so the next sync retries after the worker
+writes `exit_status`.
 
 ---
 

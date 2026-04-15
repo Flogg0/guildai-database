@@ -146,6 +146,79 @@ def _clear_dirty_marker_if_unchanged(root, seen_mtime):
         pass
 
 
+def _dirty_runs_dir(root=None):
+    return _index_db_path(root) + ".dirty.d"
+
+
+def _touch_run_dirty_marker(root, run_id):
+    """Mark a single run as needing resync. Workers call this per write
+    instead of touching the global dirty marker, so the headnode can do a
+    delta sync over only the touched runs.
+    """
+    d = _dirty_runs_dir(root)
+    try:
+        os.makedirs(d, exist_ok=True)
+    except OSError:
+        return
+    path = os.path.join(d, run_id)
+    try:
+        with open(path, "a"):
+            pass
+        os.utime(path, None)
+    except OSError as e:
+        log.debug("Failed to touch per-run dirty marker at %s: %s", path, e)
+
+
+def _list_dirty_run_markers(root=None):
+    """Return [(run_id, mtime)] for per-run dirty markers, or [] if none."""
+    d = _dirty_runs_dir(root)
+    out = []
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return out
+    for name in names:
+        if len(name) != 32:
+            continue
+        try:
+            mtime = os.path.getmtime(os.path.join(d, name))
+        except OSError:
+            continue
+        out.append((name, mtime))
+    return out
+
+
+def _clear_run_dirty_marker_if_unchanged(root, run_id, seen_mtime):
+    path = os.path.join(_dirty_runs_dir(root), run_id)
+    try:
+        if os.path.getmtime(path) == seen_mtime:
+            os.remove(path)
+    except OSError:
+        pass
+
+
+def _clear_run_dirty_markers_up_to(root, cutoff_mtime):
+    """Remove per-run markers whose mtime is <= cutoff_mtime.
+
+    Called after a full resync, which already covers every on-disk run.
+    Markers created after `cutoff_mtime` are left alone: they represent
+    worker writes that raced with the sync and should trigger a delta
+    sync on the next read.
+    """
+    d = _dirty_runs_dir(root)
+    try:
+        names = os.listdir(d)
+    except OSError:
+        return
+    for name in names:
+        path = os.path.join(d, name)
+        try:
+            if os.path.getmtime(path) <= cutoff_mtime:
+                os.remove(path)
+        except OSError:
+            pass
+
+
 def _nuke_index(root=None):
     """Delete the index DB. MUST be called with _get_index_lock held."""
     root = root or runs_dir()
@@ -241,14 +314,20 @@ def _get_index_conn(root=None):
     db_path = _index_db_path(root)
     cache_key = f"conn_{db_path}"
 
-    # Dirty-triggered full resync. Workers skip this: they read whatever
+    # Dirty-triggered resync. Workers skip this: they read whatever
     # their view of the shared index shows and rely on the FS fallback in
     # find_runs for cache misses, so they never touch the write lock.
     # The in_dirty_sync guard prevents recursive re-sync: _do_index_sync
     # constructs Run objects whose property access re-enters this function,
     # and those nested calls must return the cached conn, not start another
     # sync that would drop the conn we're writing through.
+    #
+    # Two granularities are supported:
+    #   - global marker (<db>.dirty) fresh → full resync of every on-disk run
+    #   - per-run markers (<db>.dirty.d/<run_id>) fresh → delta sync of just
+    #     the listed runs (the common case, set by worker writes)
     dirty_mtime = None
+    per_run_markers = None
     if (not _writes_disabled()
             and not getattr(_index_local, 'in_dirty_sync', False)):
         dirty_mtime = _dirty_marker_mtime(root)
@@ -256,8 +335,19 @@ def _get_index_conn(root=None):
             _drop_cached_conn(cache_key)
         else:
             dirty_mtime = None
+        if dirty_mtime is None:
+            markers = _list_dirty_run_markers(root)
+            if markers:
+                try:
+                    db_mtime = os.path.getmtime(db_path)
+                except OSError:
+                    db_mtime = 0
+                fresh = [(r, m) for (r, m) in markers if m > db_mtime]
+                if fresh:
+                    per_run_markers = fresh
+                    _drop_cached_conn(cache_key)
 
-    if dirty_mtime is None:
+    if dirty_mtime is None and per_run_markers is None:
         conn = getattr(_index_local, cache_key, None)
         if conn is not None:
             try:
@@ -329,6 +419,8 @@ def _get_index_conn(root=None):
             setattr(_index_local, cache_key, conn)
             if dirty_mtime is not None:
                 sync_kind = 'full'
+            elif per_run_markers is not None:
+                sync_kind = 'delta'
             elif _should_sync(conn, root):
                 _write_sync_marker(root)
                 sync_kind = 'add_only'
@@ -341,11 +433,21 @@ def _get_index_conn(root=None):
     # Sync OUTSIDE the lock: this can take several seconds for large runs dirs.
     if sync_kind == 'full':
         _index_local.in_dirty_sync = True
+        sync_start = time.time()
         try:
             _do_index_sync(conn, root, add_only=False)
             _clear_dirty_marker_if_unchanged(root, dirty_mtime)
+            _clear_run_dirty_markers_up_to(root, sync_start)
         except Exception as e:
             log.warning("Dirty-triggered index sync failed: %s", e)
+        finally:
+            _index_local.in_dirty_sync = False
+    elif sync_kind == 'delta':
+        _index_local.in_dirty_sync = True
+        try:
+            _do_delta_sync(conn, root, per_run_markers)
+        except Exception as e:
+            log.warning("Per-run delta sync failed: %s", e)
         finally:
             _index_local.in_dirty_sync = False
     elif sync_kind == 'add_only':
@@ -358,16 +460,24 @@ def _get_index_conn(root=None):
     return conn
 
 
-def _index_safe_write(fn, root=None):
+def _index_safe_write(fn, root=None, run_id=None):
     """Run fn under the index lock, retrying once on transient errors.
 
     Only rebuilds the index when SQLite reports actual file-level
     corruption, not on any DatabaseError. This avoids nuke-storms where a
     single transient failure empties the DB and forces every subsequent
     process through a full re-sync.
+
+    In worker (writes-disabled) mode, fn is skipped and a dirty marker is
+    touched instead. When run_id is given, the per-run marker is touched so
+    the next headnode read can delta-sync only that run; otherwise the
+    global marker is touched, forcing a full resync.
     """
     if _writes_disabled():
-        _touch_dirty_marker(root)
+        if run_id is not None:
+            _touch_run_dirty_marker(root, run_id)
+        else:
+            _touch_dirty_marker(root)
         return
     try:
         with _get_index_lock(root):
@@ -408,10 +518,12 @@ def _index_safe_write(fn, root=None):
 @contextlib.contextmanager
 def index_batch_writes(root=None):
     if _writes_disabled():
-        try:
-            yield
-        finally:
-            _touch_dirty_marker(root)
+        # Per-run markers are touched by the individual writers inside the
+        # batch (pending_writes is not set in worker mode, so each call
+        # falls through to _index_safe_write with its run_id). No global
+        # marker touch here — we don't want to force a full resync for a
+        # batch whose writes are already tracked at per-run granularity.
+        yield
         return
     depth = getattr(_index_local, 'batch_depth', 0)
     if depth == 0:
@@ -428,7 +540,15 @@ def index_batch_writes(root=None):
 
 def _flush_pending_writes(root=None):
     if _writes_disabled():
-        _touch_dirty_marker(root)
+        # Defensive path: index_batch_writes in worker mode doesn't install
+        # pending_writes, so writers inside the batch already touched their
+        # per-run markers. If some code path somehow left a pending dict,
+        # mirror its keys into per-run markers rather than forcing a global
+        # resync.
+        pending = getattr(_index_local, 'pending_writes', None)
+        if pending:
+            for rid in pending:
+                _touch_run_dirty_marker(root, rid)
         return
     pending = getattr(_index_local, 'pending_writes', None)
     if not pending:
@@ -543,6 +663,33 @@ def _do_index_sync(conn, root, add_only=False):
     _write_sync_marker(root)
 
 
+def _do_delta_sync(conn, root, markers):
+    """Upsert only the runs listed in `markers`, then clear each marker.
+
+    markers: list of (run_id, mtime) tuples from _list_dirty_run_markers.
+
+    Runs without an opref on disk are treated as removed. In-flight runs
+    (no definitive status) are skipped and their markers are left in place,
+    so the next sync retries after the worker writes exit_status.
+
+    Marker clearing is compare-by-mtime: if a worker re-touches the marker
+    while we're processing, it survives the clear and the next read will
+    pick it up.
+    """
+    for run_id, mtime in markers:
+        path = os.path.join(root, run_id)
+        if not os.path.isdir(path) or not _opref_exists(path):
+            conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+            _clear_run_dirty_marker_if_unchanged(root, run_id, mtime)
+            continue
+        if not _has_definitive_status(path):
+            continue
+        run = runlib.Run(run_id, path)
+        _index_upsert_run(conn, run)
+        _clear_run_dirty_marker_if_unchanged(root, run_id, mtime)
+    conn.commit()
+
+
 def index_sync(root=None):
     root = root or runs_dir()
     _remove_sync_marker(root)
@@ -603,7 +750,7 @@ def index_update_status(run, status, root=None):
         if conn.total_changes == 0:
             _index_upsert_run(conn, run)
         conn.commit()
-    _index_safe_write(_do, root)
+    _index_safe_write(_do, root, run_id=run.id)
 
 
 def index_update_attr(run, name, val, root=None):
@@ -644,7 +791,7 @@ def index_update_attr(run, name, val, root=None):
         else:
             return
         conn.commit()
-    _index_safe_write(_do, root)
+    _index_safe_write(_do, root, run_id=run.id)
 
 
 def index_register_run(run, root=None):
@@ -658,7 +805,7 @@ def index_register_run(run, root=None):
         conn = _get_index_conn(root)
         _index_upsert_run(conn, run)
         conn.commit()
-    _index_safe_write(_do, root)
+    _index_safe_write(_do, root, run_id=run.id)
 
 
 def index_remove_run(run_id, root=None):
@@ -670,7 +817,7 @@ def index_remove_run(run_id, root=None):
         conn = _get_index_conn(root)
         conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
         conn.commit()
-    _index_safe_write(_do, root)
+    _index_safe_write(_do, root, run_id=run_id)
 
 
 def index_get_flags(run_id, root=None):
@@ -709,12 +856,25 @@ def index_get_opref(run_id, root=None):
 _ATTR_TO_COL = {
     "status": "status",
     "opref": "opref",
+    "op_name": "op_name",
+    # 'operation' is a computed core attr (guild/index.py) that uses
+    # run_util.format_operation — the same function we store into op_name.
+    "operation": "op_name",
     "started": "started",
     "initialized": "initialized",
     "label": "label",
     "id": "run_id",
     "run": "run_id",
 }
+
+# Computed core attrs from guild/index.py _run_core_attrs that have no
+# direct index column. Returning None from _valref_to_sql for these forces
+# index_query_runs to bail out so filter_util.filtered_runs falls back to
+# the FS path, where these attrs resolve correctly.
+_CORE_ATTRS_UNINDEXABLE = frozenset({
+    "op", "op_model", "from", "short_id",
+    "sourcecode", "stopped", "time",
+})
 
 
 def _flag_col(name):
@@ -735,6 +895,8 @@ def _valref_to_sql(valref):
     col = _ATTR_TO_COL.get(valref)
     if col:
         return col, []
+    if valref in _CORE_ATTRS_UNINDEXABLE:
+        return None, None
     return _flag_col(valref), []
 
 
