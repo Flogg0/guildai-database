@@ -462,6 +462,24 @@ def _flush_pending_writes(root=None):
 _SYNC_UPSERT_BATCH = 200
 
 
+def _has_definitive_status(run_path):
+    """True if the on-disk run has unambiguous status without a PID check.
+
+    Without one of these signals, Run._local_status falls back to checking
+    whether the run's PID is alive on the *local* host — which is wrong for
+    runs executing on a different NFS node (they look dead and get marked
+    "error"). Dirty-triggered full resyncs use this to skip in-flight runs
+    and wait for the next sync after they write exit_status.
+    """
+    guild_dir = os.path.join(run_path, ".guild")
+    if os.path.exists(os.path.join(guild_dir, "attrs", "exit_status")):
+        return True
+    for marker in ("STAGED", "PENDING", "LOCK.remote"):
+        if os.path.exists(os.path.join(guild_dir, marker)):
+            return True
+    return False
+
+
 def _do_index_sync(conn, root, add_only=False):
     """Synchronize index with filesystem.
 
@@ -479,6 +497,7 @@ def _do_index_sync(conn, root, add_only=False):
     except OSError:
         names = []
     new_runs = []
+    existing_runs = []
     for name in names:
         if len(name) != 32:
             continue
@@ -486,12 +505,27 @@ def _do_index_sync(conn, root, add_only=False):
         if not _opref_exists(path):
             continue
         on_disk.add(name)
-        if name not in indexed:
+        if name in indexed:
+            existing_runs.append((name, path))
+        else:
             new_runs.append((name, path))
+    # On a full sync (add_only=False) we must also refresh existing rows:
+    # workers in GUILD_NO_INDEX_WRITES mode finalize runs on disk without
+    # updating the index, so the dirty-triggered sync is the only place
+    # their terminal status can land. Skip runs without definitive on-disk
+    # state (in-flight runs on another host) — a future sync will pick them
+    # up once they have exit_status.
+    if add_only:
+        to_upsert = new_runs
+    else:
+        to_upsert = [
+            (n, p) for (n, p) in new_runs + existing_runs
+            if _has_definitive_status(p)
+        ]
     # Commit in batches so a crash mid-sync doesn't lose all progress and
     # so other writers aren't blocked by one mega-transaction.
-    for i in range(0, len(new_runs), _SYNC_UPSERT_BATCH):
-        for name, path in new_runs[i:i + _SYNC_UPSERT_BATCH]:
+    for i in range(0, len(to_upsert), _SYNC_UPSERT_BATCH):
+        for name, path in to_upsert[i:i + _SYNC_UPSERT_BATCH]:
             run = runlib.Run(name, path)
             _index_upsert_run(conn, run)
         conn.commit()

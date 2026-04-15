@@ -810,6 +810,242 @@ def test_worker_reads_never_trigger_sync():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_dirty_sync_refreshes_existing_row_status():
+    """Mixed headnode+worker flow: headnode registers a run as pending,
+    worker finalizes it on disk (no index write, just dirty marker). The
+    next headnode op must refresh the indexed status from disk, not leave
+    it stuck at 'pending'."""
+    print(f"\n=== Test: dirty sync refreshes stale status on existing rows ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        # Headnode: register run as pending, on-disk it has no exit_status yet.
+        run_id = "e" * 32
+        run_path = os.path.join(runs_dir_path, run_id)
+        guild_dir = os.path.join(run_path, ".guild")
+        attrs_dir = os.path.join(guild_dir, "attrs")
+        os.makedirs(attrs_dir, exist_ok=True)
+        with open(os.path.join(guild_dir, "opref"), "w") as f:
+            f.write("test:test")
+        ts = str(int(time.time() * 1000000))
+        with open(os.path.join(attrs_dir, "initialized"), "w") as f:
+            f.write(ts)
+        run = runlib.Run(run_id, run_path)
+        gvar.index_register_run(run, root=runs_dir_path)
+        gvar.index_update_status(run, "pending", root=runs_dir_path)
+
+        db_path = gvar._index_db_path(runs_dir_path)
+
+        # Confirm DB has pending status.
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row and row[0] == "pending", (
+            f"seed status should be pending, got {row}"
+        )
+
+        # Worker: write exit_status + started on disk, touch dirty marker,
+        # never touch the index.
+        with open(os.path.join(attrs_dir, "started"), "w") as f:
+            f.write(ts)
+        with open(os.path.join(attrs_dir, "exit_status"), "w") as f:
+            f.write("0")
+        marker_path = db_path + ".dirty"
+        with open(marker_path, "a"):
+            pass
+        future = os.path.getmtime(db_path) + 5
+        os.utime(marker_path, (future, future))
+
+        # Headnode: fresh CLI process. Drop cached conn so dirty path fires.
+        gvar._drop_cached_conn(f"conn_{db_path}")
+
+        # Triggering a read must run the dirty sync and update the status.
+        list(gvar.find_runs("", root=runs_dir_path))
+
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+
+        assert row and row[0] == "completed", (
+            f"dirty sync did not refresh stale status: row={row}"
+        )
+        assert not os.path.exists(marker_path), (
+            "dirty marker should be cleared after successful sync"
+        )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_dirty_flag_during_run_updates_on_finalize():
+    """The dirty flag may be set while a worker run is still in-flight
+    (started on disk, no exit_status yet, PID on a different NFS host).
+    A sync triggered mid-flight must NOT falsely mark the run as 'error'.
+    Once the worker finishes and sets the flag again, the next sync must
+    correctly update the status to its terminal value."""
+    print(f"\n=== Test: dirty flag set during run updates correctly on finalize ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        # Headnode registers run A as pending; on disk it's only initialized.
+        run_id = "f" * 32
+        run_path = os.path.join(runs_dir_path, run_id)
+        guild_dir = os.path.join(run_path, ".guild")
+        attrs_dir = os.path.join(guild_dir, "attrs")
+        os.makedirs(attrs_dir, exist_ok=True)
+        with open(os.path.join(guild_dir, "opref"), "w") as f:
+            f.write("test:test")
+        ts = str(int(time.time() * 1000000))
+        with open(os.path.join(attrs_dir, "initialized"), "w") as f:
+            f.write(ts)
+        run = runlib.Run(run_id, run_path)
+        gvar.index_register_run(run, root=runs_dir_path)
+        gvar.index_update_status(run, "pending", root=runs_dir_path)
+
+        db_path = gvar._index_db_path(runs_dir_path)
+        marker_path = db_path + ".dirty"
+
+        def read_status():
+            conn = sqlite3.connect(db_path)
+            try:
+                row = conn.execute(
+                    "SELECT status FROM runs WHERE run_id = ?", (run_id,)
+                ).fetchone()
+            finally:
+                conn.close()
+            return row[0] if row else None
+
+        # Mid-run: worker has written `started`, dirty-touched, but no
+        # exit_status yet (process still executing on another host).
+        with open(os.path.join(attrs_dir, "started"), "w") as f:
+            f.write(ts)
+        with open(marker_path, "a"):
+            pass
+        future = os.path.getmtime(db_path) + 5
+        os.utime(marker_path, (future, future))
+
+        gvar._drop_cached_conn(f"conn_{db_path}")
+        list(gvar.find_runs("", root=runs_dir_path))
+
+        mid_status = read_status()
+        assert mid_status == "pending", (
+            f"mid-run sync must not overwrite stale status with false 'error';"
+            f" got {mid_status!r}"
+        )
+
+        # The marker got cleared because the sync ran; the in-flight row
+        # was skipped (not upserted). A later touch will re-trigger sync.
+
+        # Run finalizes: worker writes exit_status=0, touches marker again.
+        with open(os.path.join(attrs_dir, "exit_status"), "w") as f:
+            f.write("0")
+        with open(marker_path, "a"):
+            pass
+        future = os.path.getmtime(db_path) + 5
+        os.utime(marker_path, (future, future))
+
+        gvar._drop_cached_conn(f"conn_{db_path}")
+        list(gvar.find_runs("", root=runs_dir_path))
+
+        final_status = read_status()
+        assert final_status == "completed", (
+            f"post-finalize sync must upsert terminal status; got {final_status!r}"
+        )
+        assert not os.path.exists(marker_path), (
+            "dirty marker should be cleared after successful sync"
+        )
+
+        # Also verify a brand-new worker run (never registered on headnode)
+        # with the same lifecycle: in-flight sync skips, finalize-sync adds.
+        new_id = "9" * 32
+        new_path = os.path.join(runs_dir_path, new_id)
+        new_guild = os.path.join(new_path, ".guild")
+        new_attrs = os.path.join(new_guild, "attrs")
+        os.makedirs(new_attrs, exist_ok=True)
+        with open(os.path.join(new_guild, "opref"), "w") as f:
+            f.write("test:test")
+        with open(os.path.join(new_attrs, "initialized"), "w") as f:
+            f.write(ts)
+        with open(os.path.join(new_attrs, "started"), "w") as f:
+            f.write(ts)
+        with open(marker_path, "a"):
+            pass
+        future = os.path.getmtime(db_path) + 5
+        os.utime(marker_path, (future, future))
+
+        gvar._drop_cached_conn(f"conn_{db_path}")
+        list(gvar.find_runs("", root=runs_dir_path))
+
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM runs WHERE run_id = ?", (new_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row is None, (
+            f"in-flight new run must not be inserted with false status; got {row}"
+        )
+
+        # Finalize the new run.
+        with open(os.path.join(new_attrs, "exit_status"), "w") as f:
+            f.write("0")
+        with open(marker_path, "a"):
+            pass
+        future = os.path.getmtime(db_path) + 5
+        os.utime(marker_path, (future, future))
+
+        gvar._drop_cached_conn(f"conn_{db_path}")
+        list(gvar.find_runs("", root=runs_dir_path))
+
+        conn = sqlite3.connect(db_path)
+        try:
+            row = conn.execute(
+                "SELECT status FROM runs WHERE run_id = ?", (new_id,)
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row and row[0] == "completed", (
+            f"finalized new run should be indexed as completed; got {row}"
+        )
+
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     mp.set_start_method("fork", force=True)
     results = {}
@@ -825,6 +1061,8 @@ if __name__ == "__main__":
     results["next_op_syncs_on_dirty"] = test_next_op_syncs_on_dirty()
     results["racing_touch_preserves_marker"] = test_racing_touch_preserves_marker()
     results["worker_reads_never_trigger_sync"] = test_worker_reads_never_trigger_sync()
+    results["dirty_sync_refreshes_existing_row_status"] = test_dirty_sync_refreshes_existing_row_status()
+    results["dirty_flag_during_run_updates_on_finalize"] = test_dirty_flag_during_run_updates_on_finalize()
 
     print("\n" + "=" * 50)
     print("SUMMARY:")

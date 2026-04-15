@@ -88,8 +88,15 @@ class Run:
     def _ensure_index_row(self):
         if self._index_row is not None:
             return self._index_row
+        from guild import var
+        # During a dirty-triggered sync, _do_index_sync rebuilds rows from
+        # disk. Returning cached (stale) row values here would feed those
+        # stale values back into the sync upsert. Bypass so Run properties
+        # compute from the filesystem.
+        if getattr(var._index_local, 'in_dirty_sync', False):
+            self._index_row = {}
+            return self._index_row
         try:
-            from guild import var
             import sqlite3
             conn = var._get_index_conn()
             row = conn.execute(
@@ -110,7 +117,6 @@ class Run:
                 }
                 return self._index_row
         except sqlite3.DatabaseError:
-            from guild import var
             var._nuke_index()
         except Exception:
             pass

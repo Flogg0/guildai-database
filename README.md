@@ -63,12 +63,16 @@ Behavioral details:
   A write-lock timeout now raises loudly instead of being silently
   swallowed, so failures are visible at process exit.
 
-Known edge case: if the same run is registered by a headnode `guild run`
-(which writes a `pending`/`running` row to the index) and then finalized on
-a worker (which only touches the dirty marker), the dirty-sync sees the run
-ID already present and does not overwrite its status. This does not occur
-in pure worker-only workflows, where the run never enters the index until
-the first resync picks it up from disk in its terminal state.
+The dirty-triggered resync re-upserts every on-disk run (not just new
+ones), so a run that was registered on the headnode as `pending` and then
+finalized on a worker lands with its terminal status on the next headnode
+read. During the sync, cached index rows are bypassed so `Run` properties
+are recomputed from the filesystem.
+
+In-flight runs (no `exit_status` yet, no `STAGED`/`PENDING`/`LOCK.remote`
+marker) are skipped by the resync: on another NFS host their status would
+degrade to `error` via a local-PID check. They are picked up on the next
+sync after the worker writes `exit_status`.
 
 ---
 
