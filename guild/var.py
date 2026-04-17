@@ -1368,7 +1368,11 @@ def _delete_run(src):
     assert src and src != os.path.sep, src
     assert src.startswith(runs_dir()) or src.startswith(runs_dir(deleted=True)), src
     log.debug("deleting %s", src)
-    shutil.rmtree(src)
+    def _on_error(func, path, exc_info):
+        if isinstance(exc_info[1], FileNotFoundError):
+            return
+        raise exc_info[1]
+    shutil.rmtree(src, onerror=_on_error)
 
 
 def _move(src, dest):
