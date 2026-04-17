@@ -1089,8 +1089,7 @@ def index_query_runs(root=None, filter_expr=None, base_sql=None,
             stale.append((rid,))
     if stale:
         def _do():
-            conn.executemany("DELETE FROM runs WHERE run_id = ?",
-                             [(rid,) for rid in stale])
+            conn.executemany("DELETE FROM runs WHERE run_id = ?", stale)
             conn.commit()
         _index_safe_write(_do, root)
     return result
