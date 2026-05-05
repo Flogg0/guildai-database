@@ -56,7 +56,7 @@ def _get_index_lock(root=None):
     with _index_locks_mu:
         lock = _index_locks.get(lock_path)
         if lock is None:
-            lock = filelock.FileLock(lock_path, timeout=120)
+            lock = filelock.FileLock(lock_path, timeout=1200)
             _index_locks[lock_path] = lock
         return lock
 
@@ -511,7 +511,7 @@ def _index_safe_write(fn, root=None, run_id=None):
                         e,
                     )
     except filelock.Timeout:
-        log.error("Timeout acquiring index lock for write after 120s")
+        log.error("Timeout acquiring index lock for write after 1200s")
         raise
 
 
