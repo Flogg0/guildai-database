@@ -1352,8 +1352,14 @@ def _on_dep_source_resolved(_op, resolved_source):
 
 def _on_run_initialized(op, run):
     _init_run_manifest(run)
-    _copy_run_sourcecode(run, op)
-    _write_run_sourcecode_digest(run)
+    copied_sourcecode = _copy_run_sourcecode(run, op)
+    # Skip the sourcecode digest when there is no sourcecode to digest. It
+    # would otherwise be a write (one NFS round-trip per run, which matters
+    # when staging many runs) of a digest over an empty file set. Readers
+    # use run.get("sourcecode_digest") with None-tolerant handling, so an
+    # absent attr is equivalent to the previous empty-set digest.
+    if copied_sourcecode:
+        _write_run_sourcecode_digest(run)
     _write_run_vcs_commit(run, op)
 
 
@@ -1362,19 +1368,27 @@ def _init_run_manifest(run):
 
 
 def _copy_run_sourcecode(run, op):
+    """Copy op sourcecode into the run. Returns True if sourcecode was
+    copied, False if there was nothing to copy (disabled or no rules)."""
     assert op._opdef
     opdef = op._opdef
     if os.getenv("NO_SOURCECODE") == "1":
         log.debug("NO_SOURCECODE=1, skipping sourcecode copy")
-        return
+        return False
     sourcecode_src = opdef.guildfile.dir
     if not sourcecode_src:
         log.debug("no sourcecode source, skipping sourcecode copy")
-        return
+        return False
+    if op_util.sourcecode_disabled(opdef):
+        # 'sourcecode: no' yields an exclude-everything select rather than an
+        # empty one, so check disabled explicitly. Nothing is copied, so skip
+        # the copy (and its manifest open) and the digest write entirely.
+        log.debug("sourcecode disabled, skipping sourcecode copy")
+        return False
     sourcecode_select = op_util.sourcecode_select_for_opdef(opdef)
     if not sourcecode_select:
         log.debug("no sourcecode rules, skipping sourcecode copy")
-        return
+        return False
     dest = _sourcecode_dest(run, op)
     log.debug(
         "copying source code files for run %s from %s to %s",
@@ -1389,6 +1403,7 @@ def _copy_run_sourcecode(run, op):
         ignore=_ignored_sourcecode_paths(op),
         handler_cls=op_util.sourcecode_manifest_logger_cls(run.dir),
     )
+    return True
 
 
 def _ignored_sourcecode_paths(op):

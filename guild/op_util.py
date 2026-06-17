@@ -905,6 +905,10 @@ def _select_rules_for_opdef_(opdef, sourcecode_root):
     )
 
 
+def sourcecode_disabled(opdef):
+    return _sourcecode_disabled(opdef)
+
+
 def _sourcecode_disabled(opdef):
     return (
         opdef.sourcecode.disabled  #
