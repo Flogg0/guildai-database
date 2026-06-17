@@ -472,8 +472,18 @@ def _index_safe_write(fn, root=None, run_id=None):
     touched instead. When run_id is given, the per-run marker is touched so
     the next headnode read can delta-sync only that run; otherwise the
     global marker is touched, forcing a full resync.
+
+    Inside an index_batch_writes() scope the marker is not written here but
+    deferred: the run_id is collected and a single marker per run is emitted
+    when the batch exits. A single stage issues several index writes for the
+    same run (register, status, attr updates); without this it would create
+    the same per-run marker file ~7 times, one NFS write each.
     """
     if _writes_disabled():
+        pending = getattr(_index_local, 'pending_markers', None)
+        if pending is not None:
+            pending.add(run_id)
+            return
         if run_id is not None:
             _touch_run_dirty_marker(root, run_id)
         else:
@@ -518,12 +528,29 @@ def _index_safe_write(fn, root=None, run_id=None):
 @contextlib.contextmanager
 def index_batch_writes(root=None):
     if _writes_disabled():
-        # Per-run markers are touched by the individual writers inside the
-        # batch (pending_writes is not set in worker mode, so each call
-        # falls through to _index_safe_write with its run_id). No global
-        # marker touch here — we don't want to force a full resync for a
-        # batch whose writes are already tracked at per-run granularity.
-        yield
+        # Collect the run_ids written during the batch and emit one marker
+        # per run at exit, instead of letting each write touch its per-run
+        # marker file (the same file gets created ~7 times per stage). The
+        # end state is identical: one fresh marker per changed run, which the
+        # next headnode read delta-syncs from disk.
+        depth = getattr(_index_local, 'marker_batch_depth', 0)
+        if depth == 0:
+            _index_local.pending_markers = set()
+        _index_local.marker_batch_depth = depth + 1
+        try:
+            yield
+        finally:
+            _index_local.marker_batch_depth -= 1
+            if _index_local.marker_batch_depth == 0:
+                markers = _index_local.pending_markers
+                _index_local.pending_markers = None
+                if None in markers:
+                    # A global-marker write forces a full resync that already
+                    # covers every run, so per-run markers are redundant.
+                    _touch_dirty_marker(root)
+                else:
+                    for rid in markers:
+                        _touch_run_dirty_marker(root, rid)
         return
     depth = getattr(_index_local, 'batch_depth', 0)
     if depth == 0:
