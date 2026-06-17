@@ -104,13 +104,17 @@ def _callback(name, op, *rest_args):
 
 def init_run(op, run_dir=None):
     run = _op_init_pending_run(op, run_dir)
-    _op_init_run_attrs(op, run)
-    _callback("run_initialized", op, run)
-    # Flush the consolidated attr blob here so EVERY run-init path writes it
-    # exactly once (stage, run, batch, proto, staged trials). Attrs written
-    # after init (started, deps, env, exit_status) stay per-file, which keeps
-    # the blob immutable and avoids stale reads on restart.
-    run.flush_attr_buffer()
+    try:
+        _op_init_run_attrs(op, run)
+        _callback("run_initialized", op, run)
+    finally:
+        # Flush the consolidated attr blob here so EVERY run-init path writes it
+        # exactly once (stage, run, batch, proto, staged trials). The finally
+        # ensures buffered init attrs are still persisted if an init callback
+        # (sourcecode copy, vcs, digest) raises -- e.g. on a flaky network FS --
+        # rather than being lost. Attrs written after init (started, deps, env,
+        # exit_status) stay per-file, keeping the blob immutable across restart.
+        run.flush_attr_buffer()
     return run
 
 

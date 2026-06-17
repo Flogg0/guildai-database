@@ -392,9 +392,22 @@ class Run:
         self._attr_buffer = None
         if not buf:
             return
+        # Merge into any existing blob rather than replacing it. On a restart
+        # the run is re-initialized in place but init only re-writes a subset
+        # of attrs (init_skel skips id/initialized since they already exist,
+        # and environment attrs like host aren't re-set), so a plain overwrite
+        # would drop the attrs that weren't re-buffered.
+        merged = {}
+        try:
+            with open(self._attrs_blob_path()) as f:
+                merged = json.load(f)
+        except (IOError, OSError, ValueError):
+            merged = {}
+        merged.update(buf)
         with open(self._attrs_blob_path(), "w") as f:
-            json.dump(buf, f)
+            json.dump(merged, f)
         self._attrs_blob = None
+        self._attrs_blob_mtime = None
 
     def get_opdef_attr(self, name, default=None):
         return (self.get("opdef_attrs") or {}).get(name, default)
