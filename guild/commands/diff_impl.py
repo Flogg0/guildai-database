@@ -15,7 +15,9 @@
 import logging
 import os
 import re
+import shutil
 import subprocess
+import tempfile
 
 from guild import cli
 from guild import click_util
@@ -140,8 +142,12 @@ def _diff_runs(args, ctx):
     assert args.run and args.other_run, args
     run = runs_impl.one_run(OneRunArgs(args, args.run), ctx)
     other_run = runs_impl.one_run(OneRunArgs(args, args.other_run), ctx)
-    for path, other_path in _diff_paths(run, other_run, args):
-        _diff(path, other_path, args)
+    # tmp holds attr files materialized from the consolidated attrs.json so
+    # attr/flags/env/deps diffs work for blobbed runs; it must outlive the
+    # synchronous _diff calls below.
+    with tempfile.TemporaryDirectory(prefix="guild-diff-") as tmp:
+        for path, other_path in _diff_paths(run, other_run, args, tmp):
+            _diff(path, other_path, args)
 
 
 def _diff(path, other_path, args):
@@ -235,18 +241,18 @@ def _find_cmd(cmds):
     return DEFAULT_DIFF_CMD
 
 
-def _diff_paths(run, other_run, args):
+def _diff_paths(run, other_run, args, tmp):
     paths = []
     if args.attrs:
         _warn_redundant_attr_options(args)
-        paths.extend(_attrs_paths(run, other_run))
+        paths.extend(_attrs_paths(run, other_run, tmp))
     else:
         if args.env:
-            paths.extend(_env_paths(run, other_run))
+            paths.extend(_env_paths(run, other_run, tmp))
         if args.flags:
-            paths.extend(_flags_paths(run, other_run))
+            paths.extend(_flags_paths(run, other_run, tmp))
         if args.deps:
-            paths.extend(_deps_paths(run, other_run))
+            paths.extend(_deps_paths(run, other_run, tmp))
     if args.output:
         paths.extend(_output_paths(run, other_run))
     if args.sourcecode:
@@ -267,20 +273,60 @@ def _warn_redundant_attr_options(args):
         log.warning("ignoring --deps (already included in --attrs)")
 
 
-def _attrs_paths(run, other_run):
-    return [(run.guild_path("attrs"), other_run.guild_path("attrs"))]
+def _attrs_paths(run, other_run, tmp):
+    return [(_attrs_dir_for_diff(run, tmp), _attrs_dir_for_diff(other_run, tmp))]
 
 
-def _env_paths(run, other_run):
-    return [(run.guild_path("attrs", "env"), other_run.guild_path("attrs", "env"))]
+def _env_paths(run, other_run, tmp):
+    return [(_attr_file_for_diff(run, "env", tmp), _attr_file_for_diff(other_run, "env", tmp))]
 
 
-def _flags_paths(run, other_run):
-    return [(run.guild_path("attrs", "flags"), other_run.guild_path("attrs", "flags"))]
+def _flags_paths(run, other_run, tmp):
+    return [(_attr_file_for_diff(run, "flags", tmp), _attr_file_for_diff(other_run, "flags", tmp))]
 
 
-def _deps_paths(run, other_run):
-    return [(run.guild_path("attrs", "deps"), other_run.guild_path("attrs", "deps"))]
+def _deps_paths(run, other_run, tmp):
+    return [(_attr_file_for_diff(run, "deps", tmp), _attr_file_for_diff(other_run, "deps", tmp))]
+
+
+def _attr_file_for_diff(run, name, tmp):
+    """Path to diff attr `name` from: the real per-attr file if present, else
+    a temp file materialized from the consolidated blob (or the nonexistent
+    per-file path if the attr isn't set anywhere)."""
+    real = run.guild_path("attrs", name)
+    if os.path.exists(real):
+        return real
+    encoded = run.attr_blob_encoded(name)
+    if encoded is None:
+        return real
+    dest = os.path.join(tmp, f"{run.id}-{name}")
+    with open(dest, "w") as f:
+        f.write(encoded)
+        f.write(os.linesep)
+    return dest
+
+
+def _attrs_dir_for_diff(run, tmp):
+    """Directory holding all of run's attrs as files. The real attrs dir when
+    there's no blob; otherwise a temp dir with blob + per-file attrs merged
+    (per-file wins, matching read order)."""
+    real = run.guild_path("attrs")
+    blob = run.attrs_blob()
+    if not blob:
+        return real
+    dest = os.path.join(tmp, f"{run.id}-attrs")
+    util.ensure_dir(dest)
+    for name in util.safe_listdir(real):
+        src = os.path.join(real, name)
+        if os.path.isfile(src):
+            shutil.copyfile(src, os.path.join(dest, name))
+    for name, encoded in blob.items():
+        p = os.path.join(dest, name)
+        if not os.path.exists(p):
+            with open(p, "w") as f:
+                f.write(encoded)
+                f.write(os.linesep)
+    return dest
 
 
 def _output_paths(run, other_run):

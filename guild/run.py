@@ -361,6 +361,17 @@ class Run:
             self._attrs_blob_mtime = None
         return self._attrs_blob
 
+    def attr_blob_encoded(self, name):
+        """Raw yaml-encoded text for `name` from the consolidated blob, or
+        None if absent. For tools (cat, diff) that read attr files by path and
+        need to fall back to the blob when the per-attr file isn't present.
+        """
+        return self._load_attrs_blob().get(name)
+
+    def attrs_blob(self):
+        """The full {name: encoded} consolidated attr blob ({} if none)."""
+        return dict(self._load_attrs_blob())
+
     def begin_attr_buffer(self):
         """Start batching attr writes in memory for the consolidated blob.
 
