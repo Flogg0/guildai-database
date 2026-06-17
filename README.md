@@ -24,6 +24,17 @@ measurable speedups on local disks.
   of re-scanning the run directories.
 - Write paths are designed to match upstream cost in the common case, and
   are faster when filtering is involved.
+- Consolidates a run's init-time attributes into a single
+  `.guild/attrs.json` ("attr blob") instead of one file per attribute,
+  cutting per-run filesystem writes (see below). This is the **default**.
+- Parses run attribute files with the C YAML loader plus an integer
+  fast-path, so the bulk attribute reads during an index sync are several
+  times faster than the pure-Python `yaml.safe_load` they replaced.
+- Reduces per-stage index I/O: the dirty markers a worker writes are
+  batched to one per run, and the post-stage status print no longer opens
+  the index DB.
+- Ships the cluster staging/running tools (`guild-parallel-stager`,
+  `guild-slurm-runner`) in-tree under `guild.cluster` (see below).
 
 ## Worker-mode: `GUILD_NO_INDEX_WRITES`
 
@@ -84,6 +95,58 @@ marker) are skipped by the resync: on another NFS host their status would
 degrade to `error` via a local-PID check. The per-run marker for an
 in-flight run is left in place so the next sync retries after the worker
 writes `exit_status`.
+
+## Consolidated run attrs: `.guild/attrs.json`
+
+Upstream writes each run attribute as its own file under `.guild/attrs/`
+(`cmd`, `flags`, `host`, `id`, `op`, ...). On a networked filesystem each
+file is a separate round-trip, so a single staged run costs ~16 small
+writes just for its metadata. This fork batches the init-time attributes
+and flushes them as **one** `.guild/attrs.json` file, cutting a staged
+run's run-directory writes from ~20 to ~8.
+
+- **On by default.** Set `GUILD_ATTRS_BLOB=0` (or `false`/`no`) to opt out
+  and write the legacy per-attribute files instead.
+- **Read path is always blob-aware**, in this order: pending in-memory
+  write buffer → per-attribute file → `attrs.json`. A per-attribute file
+  takes precedence over the blob so a later `write_attr` can override a
+  value copied in via the blob (e.g. batch trials copy the proto's
+  `attrs.json`, then write their resolved flags per-file). Old per-file
+  runs and new blob runs both read correctly, and a full or delta index
+  sync handles a mix of the two.
+- **Only immutable init attrs are blobbed.** Attributes written after init
+  — `started`, `deps`, `env`, `exit_status`, `stopped` — stay per-file, so
+  the blob doesn't change after a run starts and a restart reflushes it
+  cleanly (init attrs that aren't re-written, such as `id`/`initialized`,
+  are preserved by merging into the existing blob).
+- **Tools that read attr files by path fall back to the blob.** `guild cat
+  -p .guild/attrs/<name>` emits the value from `attrs.json` when the
+  per-file form is absent, and `guild diff --attrs/--flags/--env/--deps`
+  materializes attributes from the blob into a temp dir for the diff.
+- The blob is cached per `Run` object and invalidated on the file's
+  `(mtime, size)`, so a long-lived object still sees external rewrites
+  (e.g. a worker finalizing a run) — matching the always-fresh semantics
+  of per-attribute files.
+
+## Cluster staging tools (`guild.cluster`)
+
+Two console scripts for staging and running large batches on a cluster are
+vendored in-tree (from [guild-utils](https://github.com/jkbjh/guild-utils))
+so they ship and version with this fork:
+
+- **`guild-parallel-stager`** — expands a flag-list spec into trials and
+  stages them. It stages **in-process** (reusing one imported `guild` per
+  worker) instead of forking a fresh `guild` process per trial, which
+  avoids re-paying Python import + charset-detection startup on every
+  trial; for large batches this is the dominant local cost. Pair it with
+  `GUILD_NO_INDEX_WRITES=1` to stage as dirty stores and sync the index
+  once at the end.
+- **`guild-slurm-runner`** — selects staged runs (by filter, ids, or a
+  JSON file) and either executes them directly or submits SLURM batch jobs.
+
+The scripts are registered as entry points, so a normal install of this
+fork provides them; `import guild.cluster.parallel_stager` /
+`guild.cluster.guild_runner` expose the same functions for embedding.
 
 ---
 
