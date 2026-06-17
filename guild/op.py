@@ -106,6 +106,11 @@ def init_run(op, run_dir=None):
     run = _op_init_pending_run(op, run_dir)
     _op_init_run_attrs(op, run)
     _callback("run_initialized", op, run)
+    # Flush the consolidated attr blob here so EVERY run-init path writes it
+    # exactly once (stage, run, batch, proto, staged trials). Attrs written
+    # after init (started, deps, env, exit_status) stay per-file, which keeps
+    # the blob immutable and avoids stale reads on restart.
+    run.flush_attr_buffer()
     return run
 
 
@@ -114,7 +119,7 @@ def _op_init_pending_run(op, run_dir):
     run = op_util.init_run(run_dir)
     log.debug("initializing run in %s", run.dir)
     # Batch the init-time attr writes into one consolidated file (opt-in via
-    # GUILD_ATTRS_BLOB=1). Flushed by set_run_staged / set_run_running.
+    # GUILD_ATTRS_BLOB=1); flushed at the end of init_run.
     run.begin_attr_buffer()
     run.init_skel()
     op_util.set_run_pending(run)
