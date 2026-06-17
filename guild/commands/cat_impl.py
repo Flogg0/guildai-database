@@ -39,10 +39,36 @@ def main(args, ctx):
 def _main(args, ctx):
     run = runs_impl.one_run(args, ctx)
     path = _path(run, args)
+    if not args.output and not os.path.exists(path):
+        blob_text = _attr_blob_text(run, args)
+        if blob_text is not None:
+            # The requested .guild/attrs/<name> file isn't on disk because the
+            # attr lives in the consolidated .guild/attrs.json. Emit the same
+            # text the per-attr file would have contained.
+            if args.page:
+                _page_text(blob_text)
+            else:
+                sys.stdout.write(blob_text)
+            return
     if args.page:
         _page(path)
     else:
         _cat(path)
+
+
+def _attr_blob_text(run, args):
+    if args.output or args.sourcecode or not args.path:
+        return None
+    parts = os.path.normpath(args.path).split(os.sep)
+    if len(parts) == 3 and parts[0] == ".guild" and parts[1] == "attrs":
+        encoded = run.attr_blob_encoded(parts[2])
+        if encoded is not None:
+            return encoded + os.linesep
+    return None
+
+
+def _page_text(text):
+    click.echo_via_pager(text)
 
 
 def _path(run, args):
