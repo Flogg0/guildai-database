@@ -14,6 +14,7 @@
 
 import os
 import random
+import re
 import threading
 import time
 
@@ -23,6 +24,30 @@ import yaml
 from guild import opref as opreflib
 from guild import util
 from guild import yaml_util
+
+# Attr files are read on every run lookup and, in bulk, on every index sync.
+# The pure-Python yaml.safe_load dominates sync time, so use the C loader when
+# libyaml is available and a strict fast-path for plain base-10 integers
+# (timestamps, exit_status) that the YAML int resolver decodes identically.
+try:
+    _AttrYamlLoader = yaml.CSafeLoader
+except AttributeError:  # libyaml not built
+    _AttrYamlLoader = yaml.SafeLoader
+
+# Subset of PyYAML's int resolver where Python int() yields the same value:
+# no leading zeros (avoids YAML octal), no '+', no underscores.
+_PLAIN_INT_RE = re.compile(r"^-?(?:0|[1-9][0-9]*)$")
+
+
+def _load_attr(text):
+    """Parse a run attr value, equivalent to yaml.safe_load(text).
+
+    Fast-paths plain base-10 integers (the overwhelmingly common attr type)
+    and otherwise defers to the C YAML loader.
+    """
+    if _PLAIN_INT_RE.match(text.strip()):
+        return int(text)
+    return yaml.load(text, Loader=_AttrYamlLoader)
 
 CORE_RUN_ATTRS = {
     "cmd",
@@ -157,6 +182,11 @@ class Run:
 
     def write_opref(self, opref):
         self.write_encoded_opref(str(opref))
+        # Cache the opref we just wrote so a subsequent run.opref read (e.g.
+        # the post-stage "staged as ..." print) doesn't open the index DB to
+        # look up a row that, for a just-created run, cannot exist yet. Saves
+        # an index open+probe per staged run on networked storage.
+        self._opref = opref
 
     def write_encoded_opref(self, encoded):
         with open(self._opref_path(), "w") as f:
@@ -265,7 +295,8 @@ class Run:
         except IOError as e:
             raise KeyError(name) from e
         else:
-            return yaml.safe_load(f)
+            with f:
+                return _load_attr(f.read())
 
     def _attr_path(self, name):
         return os.path.join(self._attrs_dir(), name)
