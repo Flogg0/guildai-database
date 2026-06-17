@@ -176,7 +176,7 @@ def _init_trial_for_batch_proto(proto_run, trial_run, trial_flag_vals):
 
 
 def _trial_label(proto_run, trial_flag_vals):
-    label_template = (proto_run.get("op") or {}).get("label_template")
+    label_template = (proto_run.get("op") or {}).get("label-template")
     return op_util.run_label(label_template, trial_flag_vals)
 
 
