@@ -37,21 +37,9 @@ Staged files:
     .guild/ENV
     .guild/STAGED
     .guild/attrs/
-    .guild/attrs/cmd
+    .guild/attrs.json
     .guild/attrs/deps
-    .guild/attrs/flags
-    .guild/attrs/host
-    .guild/attrs/id
-    .guild/attrs/initialized
-    .guild/attrs/op
-    .guild/attrs/platform
-    .guild/attrs/plugins
-    .guild/attrs/random_seed
-    .guild/attrs/run_params
-    .guild/attrs/sourcecode_digest
     .guild/attrs/started
-    .guild/attrs/user
-    .guild/attrs/user_flags
     .guild/manifest
     .guild/opref
     run.py
@@ -70,21 +58,9 @@ Files in run directory:
     >>> find(run_dir)  # doctest: +REPORT_UDIFF
     .guild/ENV
     .guild/STAGED
-    .guild/attrs/cmd
+    .guild/attrs.json
     .guild/attrs/deps
-    .guild/attrs/flags
-    .guild/attrs/host
-    .guild/attrs/id
-    .guild/attrs/initialized
-    .guild/attrs/op
-    .guild/attrs/platform
-    .guild/attrs/plugins
-    .guild/attrs/random_seed
-    .guild/attrs/run_params
-    .guild/attrs/sourcecode_digest
     .guild/attrs/started
-    .guild/attrs/user
-    .guild/attrs/user_flags
     .guild/manifest
     .guild/opref
     run.py
@@ -115,21 +91,9 @@ Show all files for the staged run.
     .guild/ENV
     .guild/STAGED
     .guild/attrs/
-    .guild/attrs/cmd
+    .guild/attrs.json
     .guild/attrs/deps
-    .guild/attrs/flags
-    .guild/attrs/host
-    .guild/attrs/id
-    .guild/attrs/initialized
-    .guild/attrs/op
-    .guild/attrs/platform
-    .guild/attrs/plugins
-    .guild/attrs/random_seed
-    .guild/attrs/run_params
-    .guild/attrs/sourcecode_digest
     .guild/attrs/started
-    .guild/attrs/user
-    .guild/attrs/user_flags
     .guild/manifest
     .guild/opref
     guild.yml
@@ -147,21 +111,9 @@ Files in the run directory:
     >>> find(run_dir)  # doctest: +REPORT_UDIFF
     .guild/ENV
     .guild/STAGED
-    .guild/attrs/cmd
+    .guild/attrs.json
     .guild/attrs/deps
-    .guild/attrs/flags
-    .guild/attrs/host
-    .guild/attrs/id
-    .guild/attrs/initialized
-    .guild/attrs/op
-    .guild/attrs/platform
-    .guild/attrs/plugins
-    .guild/attrs/random_seed
-    .guild/attrs/run_params
-    .guild/attrs/sourcecode_digest
     .guild/attrs/started
-    .guild/attrs/user
-    .guild/attrs/user_flags
     .guild/manifest
     .guild/opref
     guild.yml
