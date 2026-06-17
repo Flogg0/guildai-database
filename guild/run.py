@@ -475,6 +475,15 @@ class Run:
                     pass
             self._attrs_blob = None
             self._attrs_blob_mtime = None
+        # Clear the indexed column too, mirroring write_attr -- otherwise a
+        # deleted index attr (e.g. `guild label --clear`) would still read back
+        # the stale value from the SQLite index.
+        if name in self._INDEX_ATTRS:
+            try:
+                from guild import var
+                var.index_update_attr(self, name, None)
+            except Exception:
+                pass
 
     def iter_files(self, all_files=False, follow_links=False):
         for root, dirs, files in os.walk(self.path, followlinks=follow_links):
