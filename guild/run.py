@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import os
 import random
 import re
@@ -103,6 +104,11 @@ class Run:
         self._guild_dir = os.path.join(self.path, ".guild")
         self._opref = None
         self._index_row = None
+        # Attr-blob prototype: _attr_buffer holds {name: encoded} while attr
+        # writes are batched (during run init); _attrs_blob caches a parsed
+        # .guild/attrs.json. Both None until used. See write_attr / __getitem__.
+        self._attr_buffer = None
+        self._attrs_blob = None
         self._props = util.PropertyCache(
             [
                 ("timestamp", None, self._get_timestamp, 1.0),
@@ -270,9 +276,17 @@ class Run:
             return val if val is not None else default
 
     def attr_names(self):
-        return sorted(util.safe_listdir(self._attrs_dir()))
+        names = set(util.safe_listdir(self._attrs_dir()))
+        names.update(self._load_attrs_blob())
+        if self._attr_buffer:
+            names.update(self._attr_buffer)
+        return sorted(names)
 
     def has_attr(self, name):
+        if self._attr_buffer is not None and name in self._attr_buffer:
+            return True
+        if name in self._load_attrs_blob():
+            return True
         return os.path.exists(self._attr_path(name))
 
     def iter_attrs(self):
@@ -290,6 +304,15 @@ class Run:
             val = row.get(name)
             if val is not None:
                 return val
+        # Read order: pending write buffer, then the consolidated attr blob,
+        # then the legacy per-attr file (so old runs and unbuffered writes
+        # still resolve). All three store the same yaml-encoded text.
+        buf = self._attr_buffer
+        if buf is not None and name in buf:
+            return _load_attr(buf[name])
+        blob = self._load_attrs_blob()
+        if name in blob:
+            return _load_attr(blob[name])
         try:
             f = open(self._attr_path(name), "r")
         except IOError as e:
@@ -303,6 +326,50 @@ class Run:
 
     def _attrs_dir(self):
         return os.path.join(self._guild_dir, "attrs")
+
+    def _attrs_blob_path(self):
+        return os.path.join(self._guild_dir, "attrs.json")
+
+    def _load_attrs_blob(self):
+        """Return the parsed {name: encoded} attr blob, or {} if none.
+
+        Cached on the Run; invalidated by write_attr. The blob stores the
+        same yaml-encoded text as the per-attr files, so values decode
+        identically via _load_attr.
+        """
+        if self._attrs_blob is not None:
+            return self._attrs_blob
+        try:
+            with open(self._attrs_blob_path()) as f:
+                self._attrs_blob = json.load(f)
+        except (IOError, OSError, ValueError):
+            self._attrs_blob = {}
+        return self._attrs_blob
+
+    def is_attr_buffering(self):
+        return self._attr_buffer is not None
+
+    def begin_attr_buffer(self):
+        """Start batching attr writes in memory (prototype, opt-in).
+
+        Only batches when GUILD_ATTRS_BLOB=1; otherwise writes stay per-file
+        so default behavior is unchanged.
+        """
+        if os.getenv("GUILD_ATTRS_BLOB") == "1" and self._attr_buffer is None:
+            self._attr_buffer = {}
+
+    def flush_attr_buffer(self):
+        """Write buffered attrs as one .guild/attrs.json and clear the buffer.
+
+        No-op when no buffer is active.
+        """
+        buf = self._attr_buffer
+        self._attr_buffer = None
+        if not buf:
+            return
+        with open(self._attrs_blob_path(), "w") as f:
+            json.dump(buf, f)
+        self._attrs_blob = None
 
     def get_opdef_attr(self, name, default=None):
         return (self.get("opdef_attrs") or {}).get(name, default)
@@ -328,10 +395,15 @@ class Run:
             encoded = yaml_util.encode_yaml(val, strict=True)
         else:
             encoded = val
-        with open(self._attr_path(name), "w") as f:
-            f.write(encoded)
-            f.write(os.linesep)
-            f.close()
+        if self._attr_buffer is not None:
+            # Batched: defer to one consolidated write at flush_attr_buffer().
+            self._attr_buffer[name] = encoded
+        else:
+            with open(self._attr_path(name), "w") as f:
+                f.write(encoded)
+                f.write(os.linesep)
+                f.close()
+        self._attrs_blob = None
         if name in self._INDEX_ATTRS:
             try:
                 from guild import var

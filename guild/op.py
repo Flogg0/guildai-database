@@ -113,6 +113,9 @@ def _op_init_pending_run(op, run_dir):
     run_dir = run_dir or op.run_dir
     run = op_util.init_run(run_dir)
     log.debug("initializing run in %s", run.dir)
+    # Batch the init-time attr writes into one consolidated file (opt-in via
+    # GUILD_ATTRS_BLOB=1). Flushed by set_run_staged / set_run_running.
+    run.begin_attr_buffer()
     run.init_skel()
     op_util.set_run_pending(run)
     return run
