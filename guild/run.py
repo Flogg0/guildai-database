@@ -304,22 +304,25 @@ class Run:
             val = row.get(name)
             if val is not None:
                 return val
-        # Read order: pending write buffer, then the consolidated attr blob,
-        # then the legacy per-attr file (so old runs and unbuffered writes
-        # still resolve). All three store the same yaml-encoded text.
+        # Read order: pending write buffer, then a per-attr file, then the
+        # consolidated attr blob. A per-attr file wins over the blob so a later
+        # write_attr() can override a value brought in via the blob -- e.g.
+        # batch trials copytree the proto's attrs.json, then write resolved
+        # flags/label per-file. All three store the same yaml-encoded text.
         buf = self._attr_buffer
         if buf is not None and name in buf:
             return _load_attr(buf[name])
-        blob = self._load_attrs_blob()
-        if name in blob:
-            return _load_attr(blob[name])
         try:
             f = open(self._attr_path(name), "r")
-        except IOError as e:
-            raise KeyError(name) from e
+        except IOError:
+            pass
         else:
             with f:
                 return _load_attr(f.read())
+        blob = self._load_attrs_blob()
+        if name in blob:
+            return _load_attr(blob[name])
+        raise KeyError(name)
 
     def _attr_path(self, name):
         return os.path.join(self._attrs_dir(), name)
@@ -347,12 +350,14 @@ class Run:
         return self._attrs_blob
 
     def begin_attr_buffer(self):
-        """Start batching attr writes in memory (prototype, opt-in).
+        """Start batching attr writes in memory for the consolidated blob.
 
-        Only batches when GUILD_ATTRS_BLOB=1; otherwise writes stay per-file
-        so default behavior is unchanged.
+        On by default; set GUILD_ATTRS_BLOB=0 to opt out and write legacy
+        per-attr files instead.
         """
-        if os.getenv("GUILD_ATTRS_BLOB") == "1" and self._attr_buffer is None:
+        if os.getenv("GUILD_ATTRS_BLOB", "1") in ("0", "false", "False", "no"):
+            return
+        if self._attr_buffer is None:
             self._attr_buffer = {}
 
     def flush_attr_buffer(self):
