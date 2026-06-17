@@ -346,9 +346,6 @@ class Run:
             self._attrs_blob = {}
         return self._attrs_blob
 
-    def is_attr_buffering(self):
-        return self._attr_buffer is not None
-
     def begin_attr_buffer(self):
         """Start batching attr writes in memory (prototype, opt-in).
 
