@@ -109,6 +109,7 @@ class Run:
         # .guild/attrs.json. Both None until used. See write_attr / __getitem__.
         self._attr_buffer = None
         self._attrs_blob = None
+        self._attrs_blob_mtime = None
         self._props = util.PropertyCache(
             [
                 ("timestamp", None, self._get_timestamp, 1.0),
@@ -336,17 +337,28 @@ class Run:
     def _load_attrs_blob(self):
         """Return the parsed {name: encoded} attr blob, or {} if none.
 
-        Cached on the Run; invalidated by write_attr. The blob stores the
-        same yaml-encoded text as the per-attr files, so values decode
-        identically via _load_attr.
+        Cached on the Run but invalidated when the file's mtime changes, so a
+        long-lived Run object still sees the blob rewritten by another process
+        (e.g. a restart) -- matching the always-fresh semantics of per-attr
+        files. The blob stores the same yaml-encoded text as the per-attr
+        files, so values decode identically via _load_attr.
         """
-        if self._attrs_blob is not None:
+        path = self._attrs_blob_path()
+        try:
+            mtime = os.path.getmtime(path)
+        except OSError:
+            self._attrs_blob = {}
+            self._attrs_blob_mtime = None
+            return self._attrs_blob
+        if self._attrs_blob is not None and self._attrs_blob_mtime == mtime:
             return self._attrs_blob
         try:
-            with open(self._attrs_blob_path()) as f:
+            with open(path) as f:
                 self._attrs_blob = json.load(f)
+            self._attrs_blob_mtime = mtime
         except (IOError, OSError, ValueError):
             self._attrs_blob = {}
+            self._attrs_blob_mtime = None
         return self._attrs_blob
 
     def begin_attr_buffer(self):
