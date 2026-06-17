@@ -441,6 +441,23 @@ class Run:
             os.remove(self._attr_path(name))
         except OSError:
             pass
+        # Also drop it from a pending write buffer and the consolidated blob,
+        # otherwise the deleted attr would still read back from attrs.json.
+        if self._attr_buffer is not None:
+            self._attr_buffer.pop(name, None)
+        blob = self._load_attrs_blob()
+        if name in blob:
+            del blob[name]
+            if blob:
+                with open(self._attrs_blob_path(), "w") as f:
+                    json.dump(blob, f)
+            else:
+                try:
+                    os.remove(self._attrs_blob_path())
+                except OSError:
+                    pass
+            self._attrs_blob = None
+            self._attrs_blob_mtime = None
 
     def iter_files(self, all_files=False, follow_links=False):
         for root, dirs, files in os.walk(self.path, followlinks=follow_links):
