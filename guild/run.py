@@ -337,25 +337,29 @@ class Run:
     def _load_attrs_blob(self):
         """Return the parsed {name: encoded} attr blob, or {} if none.
 
-        Cached on the Run but invalidated when the file's mtime changes, so a
-        long-lived Run object still sees the blob rewritten by another process
-        (e.g. a restart) -- matching the always-fresh semantics of per-attr
-        files. The blob stores the same yaml-encoded text as the per-attr
-        files, so values decode identically via _load_attr.
+        Cached on the Run but invalidated when the file's (mtime, size) change,
+        so a long-lived Run object still sees the blob rewritten by another
+        process (e.g. a restart) -- matching the always-fresh semantics of
+        per-attr files. Size is checked alongside mtime because mtime
+        resolution on some networked filesystems is coarse (1-2s), and a
+        same-second rewrite usually changes the file size. The blob stores the
+        same yaml-encoded text as the per-attr files, so values decode
+        identically via _load_attr.
         """
         path = self._attrs_blob_path()
         try:
-            mtime = os.path.getmtime(path)
+            st = os.stat(path)
+            stamp = (st.st_mtime, st.st_size)
         except OSError:
             self._attrs_blob = {}
             self._attrs_blob_mtime = None
             return self._attrs_blob
-        if self._attrs_blob is not None and self._attrs_blob_mtime == mtime:
+        if self._attrs_blob is not None and self._attrs_blob_mtime == stamp:
             return self._attrs_blob
         try:
             with open(path) as f:
                 self._attrs_blob = json.load(f)
-            self._attrs_blob_mtime = mtime
+            self._attrs_blob_mtime = stamp
         except (IOError, OSError, ValueError):
             self._attrs_blob = {}
             self._attrs_blob_mtime = None

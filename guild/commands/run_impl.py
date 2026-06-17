@@ -1352,14 +1352,13 @@ def _on_dep_source_resolved(_op, resolved_source):
 
 def _on_run_initialized(op, run):
     _init_run_manifest(run)
-    copied_sourcecode = _copy_run_sourcecode(run, op)
-    # Skip the sourcecode digest when there is no sourcecode to digest. It
-    # would otherwise be a write (one NFS round-trip per run, which matters
-    # when staging many runs) of a digest over an empty file set. Readers
-    # use run.get("sourcecode_digest") with None-tolerant handling, so an
-    # absent attr is equivalent to the previous empty-set digest.
-    if copied_sourcecode:
-        _write_run_sourcecode_digest(run)
+    # _copy_run_sourcecode skips the copy (and a redundant manifest open) when
+    # sourcecode is disabled, but always write the digest: it goes into the
+    # consolidated attrs.json (no extra file write in the default blob mode),
+    # and batch optimizers with `prev-trials: sourcecode` hard-error if the
+    # proto has no sourcecode_digest attr.
+    _copy_run_sourcecode(run, op)
+    _write_run_sourcecode_digest(run)
     _write_run_vcs_commit(run, op)
 
 
