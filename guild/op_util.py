@@ -691,15 +691,26 @@ def set_run_started(run):
 
 def set_run_running(run):
     set_run_started(run)
+    run.flush_attr_buffer()
     # "running" status is not written to index — not useful and adds NFS write load
 
 
 def set_run_staged(run):
     with var.index_batch_writes():
-        set_run_marker(run, "STAGED")
-        clear_run_pending(run)
-        set_run_started(run)
-        var.index_update_status(run, "staged")
+        if run.is_attr_buffering():
+            # Blob mode: write started, flush the consolidated attrs.json, and
+            # only then write STAGED so the run isn't visible as staged before
+            # its attrs are on disk.
+            set_run_started(run)
+            run.flush_attr_buffer()
+            set_run_marker(run, "STAGED")
+            clear_run_pending(run)
+            var.index_update_status(run, "staged")
+        else:
+            set_run_marker(run, "STAGED")
+            clear_run_pending(run)
+            set_run_started(run)
+            var.index_update_status(run, "staged")
 
 
 ###################################################################
