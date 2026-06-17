@@ -3,6 +3,7 @@
 guild = guild.main_bootstrap:main
 guild-parallel-stager = guild.cluster.parallel_stager:main
 guild-slurm-runner = guild.cluster.guild_runner:main
+guild-utils-stager = guild.cluster.old_stager:main
 
 [guild.plugins]
 
