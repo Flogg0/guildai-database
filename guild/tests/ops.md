@@ -36,12 +36,10 @@ The run is generated in the specified run directory:
 Generated files:
 
     >>> find(op.run_dir)
-    .guild/attrs/cmd
+    .guild/attrs.json
     .guild/attrs/deps
     .guild/attrs/env
     .guild/attrs/exit_status
-    .guild/attrs/id
-    .guild/attrs/initialized
     .guild/attrs/started
     .guild/attrs/stopped
     .guild/opref
@@ -59,10 +57,8 @@ Files for a staged run:
     >>> find(run.dir)
     .guild/ENV
     .guild/STAGED
-    .guild/attrs/cmd
+    .guild/attrs.json
     .guild/attrs/deps
-    .guild/attrs/id
-    .guild/attrs/initialized
     .guild/attrs/started
     .guild/opref
 
