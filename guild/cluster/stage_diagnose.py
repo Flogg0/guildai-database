@@ -51,6 +51,34 @@ def _runs_dir():
         return os.path.join(home, "runs")
 
 
+def _staging_env_setup(tmp_home):
+    """Set GUILD_HOME plus the same env the real parallel stager uses (worker
+    mode + a precomputed GUILD_VCS_COMMIT), so the probes measure the actual
+    optimized staging path rather than the un-optimized one. Returns prior
+    values for restore."""
+    keys = ("GUILD_HOME", "GUILD_NO_INDEX_WRITES", "GUILD_VCS_COMMIT")
+    prev = {k: os.environ.get(k) for k in keys}
+    os.environ["GUILD_HOME"] = tmp_home
+    os.environ["GUILD_NO_INDEX_WRITES"] = "1"
+    if not os.environ.get("GUILD_VCS_COMMIT") and os.environ.get("NO_VCS_COMMIT") != "1":
+        try:
+            from guild import config, op_util
+            val = op_util.vcs_commit_for_dir(config.cwd())
+            if val:
+                os.environ["GUILD_VCS_COMMIT"] = val
+        except Exception:
+            pass
+    return prev
+
+
+def _staging_env_restore(prev):
+    for k, v in prev.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = v
+
+
 def _stats_us(times):
     """(median, p95, mean, min) in microseconds from a list of seconds."""
     if not times:
@@ -296,9 +324,7 @@ def probe_compare_exec(operation_args, trials, n_jobs):
     # loky rows may show staged 0 -- a local quirk, not a cluster result.)
     tmp_home = tempfile.mkdtemp(prefix=".guild_diag_", dir=parent)
     os.makedirs(os.path.join(tmp_home, "runs"), exist_ok=True)
-    prev = {k: os.environ.get(k) for k in ("GUILD_HOME", "GUILD_NO_INDEX_WRITES")}
-    os.environ["GUILD_HOME"] = tmp_home
-    os.environ["GUILD_NO_INDEX_WRITES"] = "1"
+    prev = _staging_env_setup(tmp_home)
 
     op = operation_args[0]
     flags = " ".join(operation_args[1:])
@@ -345,11 +371,7 @@ def probe_compare_exec(operation_args, trials, n_jobs):
             # 3. loky, N workers
             rep["jbN_s"], rep["jbN_pids"], rep["jbN_staged"], rep["jbN_err"] = _run_joblib(n_jobs)
     finally:
-        for k, v in prev.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        _staging_env_restore(prev)
         shutil.rmtree(tmp_home, ignore_errors=True)
     return rep
 
@@ -370,9 +392,7 @@ def probe_stage_profile(operation_args, warmup=3):
     parent = os.path.dirname(os.path.dirname(real_runs))
     tmp_home = tempfile.mkdtemp(prefix=".guild_diag_", dir=parent)
     os.makedirs(os.path.join(tmp_home, "runs"), exist_ok=True)
-    prev = {k: os.environ.get(k) for k in ("GUILD_HOME", "GUILD_NO_INDEX_WRITES")}
-    os.environ["GUILD_HOME"] = tmp_home
-    os.environ["GUILD_NO_INDEX_WRITES"] = "1"
+    prev = _staging_env_setup(tmp_home)
 
     op = operation_args[0]
     flags = " ".join(operation_args[1:])
@@ -406,11 +426,7 @@ def probe_stage_profile(operation_args, warmup=3):
             report["warm_stage_s"] = time.perf_counter() - t0
             report["profiled_staged"] = _count() - c
     finally:
-        for k, v in prev.items():
-            if v is None:
-                os.environ.pop(k, None)
-            else:
-                os.environ[k] = v
+        _staging_env_restore(prev)
         shutil.rmtree(tmp_home, ignore_errors=True)
 
     rows = []
