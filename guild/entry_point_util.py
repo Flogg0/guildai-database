@@ -40,6 +40,7 @@ class EntryPointResources:
         self.desc = desc
         self.__working_set = None
         self.__resources = None
+        self.__ws_cache = {}
 
     def __str__(self):
         return (
@@ -98,9 +99,22 @@ class EntryPointResources:
         return self._working_set.entries
 
     def set_path(self, val, clear_cache=False):
+        # Building a pkg_resources.WorkingSet rescans every path entry (reads
+        # each distribution's metadata). Restoring the full sys.path on
+        # SetPath.__exit__ otherwise re-walks all installed distributions on
+        # every call -- the dominant per-stage cost on networked installs.
+        # Cache the WorkingSet per path so an unchanged path is reused.
+        key = tuple(val) if val is not None else None
         if clear_cache:
             self._clear_path_importer_cache(val)
-        self.__working_set = pkg_resources.WorkingSet(val)
+            ws = pkg_resources.WorkingSet(val)
+            self.__ws_cache[key] = ws
+        else:
+            ws = self.__ws_cache.get(key)
+            if ws is None:
+                ws = pkg_resources.WorkingSet(val)
+                self.__ws_cache[key] = ws
+        self.__working_set = ws
         self.__resources = None
 
     @staticmethod
