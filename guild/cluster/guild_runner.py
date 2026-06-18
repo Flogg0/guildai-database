@@ -479,6 +479,14 @@ def main():
         ),
     )
     parser.add_argument(
+        "--shuffle",
+        action="store_true",
+        help=(
+            "Randomize run order before chunking so long/short runs are spread evenly "
+            "across job-array tasks rather than clumping into a few tasks."
+        ),
+    )
+    parser.add_argument(
         "--shared-queue",
         action="store_true",
         help=(
@@ -554,6 +562,11 @@ def main():
         runs = Runs.bare_ids_to_json(args.runids)
     elif args.runsfile:
         runs = Runs.read_json(args.runsfile)
+
+    if args.shuffle and runs:
+        # Randomize before chunking so hard runs are spread evenly across the
+        # job-array tasks instead of clumping into a few unlucky chunks.
+        random.shuffle(runs)
 
     if args.store_runs:
         Runs.store_json(runs, args.store_runs)
