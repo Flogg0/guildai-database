@@ -33,6 +33,13 @@ measurable speedups on local disks.
 - Reduces per-stage index I/O: the dirty markers a worker writes are
   batched to one per run, and the post-stage status print no longer opens
   the index DB.
+- Runs the index DB with `synchronous=OFF`. The index is a derived cache
+  (rebuilt on corruption and kept fresh by dirty markers), so per-commit
+  fsyncs buy nothing and are removed — the dominant per-stage cost on a
+  networked index DB.
+- Memoizes the per-script flag-import cache in-process, so staging many
+  trials of the same operation validates the cache once rather than
+  re-`stat`-ing it for every trial.
 - Ships the cluster staging/running tools (`guild-parallel-stager`,
   `guild-slurm-runner`) in-tree under `guild.cluster` (see below).
 
@@ -96,6 +103,14 @@ degrade to `error` via a local-PID check. The per-run marker for an
 in-flight run is left in place so the next sync retries after the worker
 writes `exit_status`.
 
+## Rebuilding the index
+
+`guild check --rebuild-index` deletes the index DB and rebuilds it from
+scratch by scanning every run directory. Unlike a normal sync (which reuses
+the existing DB file), this drops the DB entirely, so it also clears a stale
+schema or leftover rows from an older version of the index format. Dirty and
+sync markers are cleared too, leaving a freshly-synced index.
+
 ## Consolidated run attrs: `.guild/attrs.json`
 
 Upstream writes each run attribute as its own file under `.guild/attrs/`
@@ -138,11 +153,20 @@ so they ship and version with this fork:
   stages them. It stages **in-process** (reusing one imported `guild` per
   worker) instead of forking a fresh `guild` process per trial, which
   avoids re-paying Python import + charset-detection startup on every
-  trial; for large batches this is the dominant local cost. Pair it with
-  `GUILD_NO_INDEX_WRITES=1` to stage as dirty stores and sync the index
-  once at the end.
+  trial; for large batches this is the dominant local cost. It stages in
+  **worker mode automatically** — it sets `GUILD_NO_INDEX_WRITES=1` for its
+  workers so per-trial index writes become per-run dirty markers, then
+  resyncs the index once after all trials are staged.
 - **`guild-slurm-runner`** — selects staged runs (by filter, ids, or a
   JSON file) and either executes them directly or submits SLURM batch jobs.
+- **`guild-stage-diagnose`** — measures the actual wall-clock cost of the
+  operations staging performs, to locate the bottleneck on a given filesystem
+  (esp. a cluster NAS): latency of filesystem primitives (stat, create+write,
+  fsync, mkdir, rename, unlink, readdir), SQLite commit latency at
+  `synchronous=OFF/NORMAL/FULL`, and — with `--operation` — end-to-end staging
+  phase timings. It only writes to its own temp dirs and never touches real
+  runs. Run `guild-stage-diagnose --help`, or
+  `python -m guild.cluster.stage_diagnose`.
 
 The scripts are registered as entry points, so a normal install of this
 fork provides them; `import guild.cluster.parallel_stager` /
