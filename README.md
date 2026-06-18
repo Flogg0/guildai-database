@@ -163,9 +163,11 @@ so they ship and version with this fork:
   operations staging performs, to locate the bottleneck on a given filesystem
   (esp. a cluster NAS): latency of filesystem primitives (stat, create+write,
   fsync, mkdir, rename, unlink, readdir), SQLite commit latency at
-  `synchronous=OFF/NORMAL/FULL`, and — with `--operation` — end-to-end staging
-  phase timings. It only writes to its own temp dirs and never touches real
-  runs. Run `guild-stage-diagnose --help`, or
+  `synchronous=OFF/NORMAL/FULL`, end-to-end staging phase timings (with
+  `--operation`), and — with `--operation --profile` — a cProfile of a single
+  warm stage showing which functions/syscalls dominate (built-ins like
+  `posix.stat`/`open` reveal NFS-blocking time). It only writes to its own temp
+  dirs and never touches real runs. Run `guild-stage-diagnose --help`, or
   `python -m guild.cluster.stage_diagnose`.
 
 The scripts are registered as entry points, so a normal install of this
