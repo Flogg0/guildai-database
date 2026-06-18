@@ -242,6 +242,118 @@ def probe_staging(operation_args, trials, n_jobs):
     return report
 
 
+def _diag_stage_task(argv):
+    """Module-level (picklable for loky) single in-process stage. Returns
+    (pid, error, run_id): error is None on success; run_id is the 32-char id of
+    the staged run (parsed from output) so the caller can clean up exactly the
+    runs it created. Surfaces failures instead of counting errored tasks as
+    instant."""
+    import os as _os
+    import io as _io
+    import re as _re
+    import contextlib as _cl
+    _os.environ["GUILD_NO_INDEX_WRITES"] = "1"
+    err = None
+    run_id = None
+    buf = _io.StringIO()
+    try:
+        from guild.commands.main import main as guild_cli
+        with _cl.redirect_stdout(buf), _cl.redirect_stderr(buf):
+            guild_cli.main(args=list(argv), standalone_mode=False)
+    except SystemExit as e:
+        if e.code not in (0, None):
+            err = "exit %r: %s" % (e.code, buf.getvalue().strip()[:300])
+    except BaseException as e:
+        err = "%s: %s | %s" % (type(e).__name__, str(e)[:150],
+                               buf.getvalue().strip()[:200])
+    m = _re.search(r"staged as ([0-9a-f]{32})", buf.getvalue())
+    if m:
+        run_id = m.group(1)
+    return (_os.getpid(), err, run_id)
+
+
+def probe_compare_exec(operation_args, trials, n_jobs):
+    """Stage `trials` the same way the parallel-stager would, but three ways, to
+    isolate joblib/loky overhead from the actual per-trial work:
+
+      1. sequential, in one process (no joblib),
+      2. joblib at n_jobs=1,
+      3. joblib at n_jobs=`n_jobs`.
+
+    All use the identical `guild run --stage` path (no batch copytree), in a
+    throwaway GUILD_HOME on the same filesystem, in worker mode. Also reports
+    distinct worker PIDs per joblib run (1 ⇒ worker reused; ~trials ⇒ a fresh
+    worker per task, i.e. per-task re-import).
+    """
+    import joblib
+
+    real_runs = _runs_dir()
+    parent = os.path.dirname(os.path.dirname(real_runs))
+    # Throwaway GUILD_HOME on the same filesystem (worker mode), exactly like
+    # the --operation probe. SAFE: only this temp dir is ever written/removed;
+    # real runs are never touched. (On the cluster this stages fine in loky
+    # workers, as the --operation probe demonstrates; on some local setups the
+    # loky rows may show staged 0 -- a local quirk, not a cluster result.)
+    tmp_home = tempfile.mkdtemp(prefix=".guild_diag_", dir=parent)
+    os.makedirs(os.path.join(tmp_home, "runs"), exist_ok=True)
+    prev = {k: os.environ.get(k) for k in ("GUILD_HOME", "GUILD_NO_INDEX_WRITES")}
+    os.environ["GUILD_HOME"] = tmp_home
+    os.environ["GUILD_NO_INDEX_WRITES"] = "1"
+
+    op = operation_args[0]
+    flags = " ".join(operation_args[1:])
+    argv = ("run --yes %s --stage %s" % (op, flags)).split()
+    runs_dir = os.path.join(tmp_home, "runs")
+
+    def _count():
+        try:
+            return sum(1 for n in os.listdir(runs_dir) if len(n) == 32)
+        except OSError:
+            return 0
+
+    rep = {"trials": trials, "n_jobs": n_jobs}
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            def _run_joblib(nj):
+                # Force loky so even n_jobs=1 uses a real worker process
+                # (joblib's default runs n_jobs=1 in-process, not exercising loky).
+                c = _count()
+                t0 = time.perf_counter()
+                res = joblib.Parallel(n_jobs=nj, backend="loky")(
+                    joblib.delayed(_diag_stage_task)(argv) for _ in range(trials))
+                dt = time.perf_counter() - t0
+                pids = set(p for p, _, _ in res)
+                errs = [e for _, e, _ in res if e]
+                return dt, len(pids), _count() - c, (errs[0] if errs else None)
+
+            # cold (one stage) to warm the import in THIS process
+            t0 = time.perf_counter()
+            _diag_stage_task(argv)
+            rep["cold_s"] = time.perf_counter() - t0
+
+            # 1. sequential, in-process (warm)
+            c = _count()
+            t0 = time.perf_counter()
+            for _ in range(trials):
+                _diag_stage_task(argv)
+            rep["seq_s"] = time.perf_counter() - t0
+            rep["seq_staged"] = _count() - c
+
+            # 2. loky, 1 worker
+            rep["jb1_s"], rep["jb1_pids"], rep["jb1_staged"], rep["jb1_err"] = _run_joblib(1)
+            # 3. loky, N workers
+            rep["jbN_s"], rep["jbN_pids"], rep["jbN_staged"], rep["jbN_err"] = _run_joblib(n_jobs)
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp_home, ignore_errors=True)
+    return rep
+
+
 def probe_stage_profile(operation_args, warmup=3):
     """cProfile a single WARM in-process stage against the NFS, so the exact
     functions/syscalls that eat the per-trial seconds are visible.
@@ -355,6 +467,10 @@ def main():
     parser.add_argument("--profile", action="store_true",
                         help="cProfile a single warm stage of --operation and "
                              "show which functions/syscalls dominate.")
+    parser.add_argument("--compare-exec", action="store_true",
+                        help="Stage --trials trials of --operation three ways "
+                             "(sequential in-process, joblib n_jobs=1, joblib "
+                             "n_jobs=N) to isolate joblib/loky overhead.")
     parser.add_argument("--warmup", type=int, default=3,
                         help="Warm-up stages before profiling (default 3).")
     args = parser.parse_args()
@@ -398,6 +514,31 @@ def main():
         if not args.operation:
             parser.error("--profile requires --operation")
         _print_profile(probe_stage_profile(args.operation.split(), warmup=args.warmup))
+
+    if args.compare_exec:
+        if not args.operation:
+            parser.error("--compare-exec requires --operation")
+        n = args.n_jobs or 8
+        r = probe_compare_exec(args.operation.split(), args.trials, n)
+        t = r["trials"]
+        print("\n== Execution comparison (%d trials, worker mode) ==" % t)
+        print("  cold first stage          : %8.3f s   (one-time import)" % r["cold_s"])
+        print("  sequential in-process     : %8.3f s  (%.1f ms/trial)  staged %d/%d"
+              % (r["seq_s"], r["seq_s"] / t * 1e3, r["seq_staged"], t))
+        print("  loky n_jobs=1             : %8.3f s  (%.1f ms/trial)  staged %d/%d  %d PID(s)"
+              % (r["jb1_s"], r["jb1_s"] / t * 1e3, r["jb1_staged"], t, r["jb1_pids"]))
+        if r.get("jb1_err"):
+            print("      worker error: %s" % r["jb1_err"])
+        print("  loky n_jobs=%-3d           : %8.3f s  (%.1f ms/trial)  staged %d/%d  %d PID(s)"
+              % (r["n_jobs"], r["jbN_s"], r["jbN_s"] / t * 1e3, r["jbN_staged"], t, r["jbN_pids"]))
+        if r.get("jbN_err"):
+            print("      worker error: %s" % r["jbN_err"])
+        print("\n  NOTE: trust a row only if it staged trials/trials; a row that")
+        print("  staged fewer errored (see worker error) and its time is moot.")
+        print("  If sequential << loky    -> the loky worker layer is the overhead.")
+        print("  If joblib PIDs ~= trials -> loky spawns a fresh worker per task")
+        print("  (per-task re-import over NFS). If PIDs are few, reuse works and")
+        print("  the cost is elsewhere.")
 
 
 if __name__ == "__main__":
