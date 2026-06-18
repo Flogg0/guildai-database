@@ -40,6 +40,13 @@ measurable speedups on local disks.
 - Memoizes the per-script flag-import cache in-process, so staging many
   trials of the same operation validates the cache once rather than
   re-`stat`-ing it for every trial.
+- Caches the pkg_resources `WorkingSet` per path in `EntryPointResources`, so
+  resolving the cwd model no longer rescans every `sys.path` entry on each
+  call. Model resolution wraps the lookup in a temporary `SetPath` and restores
+  the full `sys.path` on exit; that restore previously rebuilt the WorkingSet
+  (re-reading every installed distribution's metadata) on every `guild run` —
+  ~218 `find_on_path` scans per op resolution, the second-biggest per-stage
+  cost on a networked install. Now an unchanged path reuses its cached set.
 - Avoids recomputing the VCS commit per staged run: recording `vcs_commit`
   shells out to `git` (incl. a `git status` working-tree walk, costly on a
   networked filesystem). The parallel stager computes it once and passes it to
