@@ -40,6 +40,11 @@ measurable speedups on local disks.
 - Memoizes the per-script flag-import cache in-process, so staging many
   trials of the same operation validates the cache once rather than
   re-`stat`-ing it for every trial.
+- Avoids recomputing the VCS commit per staged run: recording `vcs_commit`
+  shells out to `git` (incl. a `git status` working-tree walk, costly on a
+  networked filesystem). The parallel stager computes it once and passes it to
+  every trial via `GUILD_VCS_COMMIT`; `write_vcs_commit` uses that value
+  instead of re-running git. (`NO_VCS_COMMIT=1` still skips it entirely.)
 - Ships the cluster staging/running tools (`guild-parallel-stager`,
   `guild-slurm-runner`) in-tree under `guild.cluster` (see below).
 
