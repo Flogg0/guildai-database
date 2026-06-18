@@ -242,6 +242,94 @@ def probe_staging(operation_args, trials, n_jobs):
     return report
 
 
+def probe_stage_profile(operation_args, warmup=3):
+    """cProfile a single WARM in-process stage against the NFS, so the exact
+    functions/syscalls that eat the per-trial seconds are visible.
+
+    The first stage in the process is cold (module import over NFS); we run
+    `warmup` stages first and profile a warm one, matching the per-trial cost
+    that dominates a large batch. Runs in a throwaway GUILD_HOME on the same
+    filesystem, in worker mode (GUILD_NO_INDEX_WRITES=1) to match real staging.
+    """
+    import cProfile
+    import pstats
+    from guild.commands.main import main as guild_cli
+
+    real_runs = _runs_dir()
+    parent = os.path.dirname(os.path.dirname(real_runs))
+    tmp_home = tempfile.mkdtemp(prefix=".guild_diag_", dir=parent)
+    os.makedirs(os.path.join(tmp_home, "runs"), exist_ok=True)
+    prev = {k: os.environ.get(k) for k in ("GUILD_HOME", "GUILD_NO_INDEX_WRITES")}
+    os.environ["GUILD_HOME"] = tmp_home
+    os.environ["GUILD_NO_INDEX_WRITES"] = "1"
+
+    op = operation_args[0]
+    flags = " ".join(operation_args[1:])
+    argv = ("run --yes %s --stage %s" % (op, flags)).split()
+
+    def one_stage():
+        try:
+            guild_cli.main(args=list(argv), standalone_mode=False)
+        except SystemExit:
+            pass
+        except BaseException:
+            pass
+
+    report = {}
+    pr = cProfile.Profile()
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), \
+                contextlib.redirect_stderr(io.StringIO()):
+            t0 = time.perf_counter()
+            one_stage()
+            report["cold_stage_s"] = time.perf_counter() - t0
+            for _ in range(max(0, warmup - 1)):
+                one_stage()
+            t0 = time.perf_counter()
+            pr.enable()
+            one_stage()
+            pr.disable()
+            report["warm_stage_s"] = time.perf_counter() - t0
+    finally:
+        for k, v in prev.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        shutil.rmtree(tmp_home, ignore_errors=True)
+
+    rows = []
+    for func, (cc, nc, tt, ct, callers) in pstats.Stats(pr).stats.items():
+        fn, ln, name = func
+        label = "%s:%d(%s)" % (os.path.basename(fn), ln, name)
+        rows.append({"tt": tt, "ct": ct, "nc": nc, "label": label, "fn": fn})
+    report["rows"] = rows
+    return report
+
+
+def _print_profile(report):
+    print("\n== Single-stage profile (warm, worker mode) ==")
+    print("  cold first stage : %8.3f s   (one-time module import over NFS)"
+          % report.get("cold_stage_s", 0))
+    print("  warm stage (profiled): %8.3f s   <- the per-trial cost that matters"
+          % report.get("warm_stage_s", 0))
+    rows = report.get("rows", [])
+
+    print("\n  Top 25 by SELF time (where the seconds are actually spent;")
+    print("  built-ins like posix.stat/open/read = NFS syscall blocking):")
+    print("  %10s %10s %9s  %s" % ("self_s", "cum_s", "ncalls", "function"))
+    for r in sorted(rows, key=lambda r: r["tt"], reverse=True)[:25]:
+        print("  %10.3f %10.3f %9s  %s"
+              % (r["tt"], r["ct"], r["nc"], r["label"]))
+
+    guild_rows = [r for r in rows if os.sep + "guild" + os.sep in r["fn"]]
+    print("\n  Top 20 guild functions by CUMULATIVE time (the phase hierarchy):")
+    print("  %10s %10s %9s  %s" % ("cum_s", "self_s", "ncalls", "function"))
+    for r in sorted(guild_rows, key=lambda r: r["ct"], reverse=True)[:20]:
+        print("  %10.3f %10.3f %9s  %s"
+              % (r["ct"], r["tt"], r["nc"], r["label"]))
+
+
 def _print_table(title, results):
     print("\n== %s ==" % title)
     print("  %-26s %10s %10s %10s %10s" % ("op", "median_us", "p95_us", "mean_us", "min_us"))
@@ -264,6 +352,11 @@ def main():
                         help="Trials to stage in the end-to-end probe (default 50).")
     parser.add_argument("--n-jobs", type=int, default=None,
                         help="joblib workers for the end-to-end probe.")
+    parser.add_argument("--profile", action="store_true",
+                        help="cProfile a single warm stage of --operation and "
+                             "show which functions/syscalls dominate.")
+    parser.add_argument("--warmup", type=int, default=3,
+                        help="Warm-up stages before profiling (default 3).")
     args = parser.parse_args()
 
     runs = _runs_dir()
@@ -290,7 +383,7 @@ def main():
     finally:
         shutil.rmtree(diag_dir, ignore_errors=True)
 
-    if args.operation:
+    if args.operation and not args.profile:
         op_args = args.operation.split()
         print("\n== End-to-end staging phases ==")
         print("  staging %d trials of: %s" % (args.trials, args.operation))
@@ -300,6 +393,11 @@ def main():
               % (rep.get("n_jobs") or 0, rep.get("parallel_stage_s", 0),
                  rep.get("parallel_per_trial_ms", 0)))
         print("  post-stage index resync : %8.3f s" % rep.get("resync_s", 0))
+
+    if args.profile:
+        if not args.operation:
+            parser.error("--profile requires --operation")
+        _print_profile(probe_stage_profile(args.operation.split(), warmup=args.warmup))
 
 
 if __name__ == "__main__":
