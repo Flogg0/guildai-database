@@ -181,7 +181,9 @@ so they ship and version with this fork:
   under `$GUILD_HOME/_slurm_queue` by default (override with `--queue-dir`);
   set `--use-jobs N` to your max concurrency. With `--job-array`, add
   `--shuffle` to randomize run order before chunking so long/short runs spread
-  evenly across tasks rather than clumping.
+  evenly across tasks rather than clumping; if the task count exceeds the
+  cluster's `MaxArraySize` (auto-detected) it auto-splits across several arrays,
+  and `--num-arrays N` forces a specific count.
 - **`guild-stage-diagnose`** — measures the actual wall-clock cost of the
   operations staging performs, to locate the bottleneck on a given filesystem
   (esp. a cluster NAS): latency of filesystem primitives (stat, create+write,
