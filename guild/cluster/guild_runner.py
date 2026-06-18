@@ -517,6 +517,16 @@ def main():
         ),
     )
     parser.add_argument(
+        "--max-running",
+        type=int,
+        default=0,
+        help=(
+            "With --job-array, overall cap on how many tasks run at once. SLURM's "
+            "array throttle is per-array, so this is split across the arrays so the "
+            "total stays ~max-running. 0 = no cap (bounded only by your QOS)."
+        ),
+    )
+    parser.add_argument(
         "--shared-queue",
         action="store_true",
         help=(
@@ -760,14 +770,28 @@ def main():
                 num_arrays = max(1, int(math.ceil(num_tasks / max_array_size)))
             tasks_per_array = int(math.ceil(num_tasks / num_arrays))
             array_groups = list(chunk(chunks, tasks_per_array))
+            # Distribute an overall concurrency cap across the arrays: SLURM's "%M"
+            # throttle is per-array, so split max-running so the total stays ~M.
+            n_arr = len(array_groups)
+            if args.max_running > 0:
+                base, rem = divmod(args.max_running, n_arr)
+                array_throttles = [max(1, base + (1 if i < rem else 0)) for i in range(n_arr)]
+            else:
+                array_throttles = [None] * n_arr
             # Summarize instead of listing every chunk (could be thousands). Each
             # value is runs-per-task, and SLURM may pack several tasks per node.
             lo, hi = min(chunk_sizes), max(chunk_sizes)
             runs_per_task = f"{lo}" if lo == hi else f"{lo}-{hi}"
+            running_desc = ""
+            if args.max_running > 0:
+                effective = sum(array_throttles)
+                running_desc = f", <= {effective} running at once"
+                if args.max_running < n_arr:
+                    running_desc += f" (cap raised from {args.max_running}: one per array, {n_arr} arrays)"
             print(
                 f"Submitting {len(array_groups)} SLURM job array(s): {num_tasks} tasks total, "
                 f"{runs_per_task} runs per task ({nr_of_runs} runs total), "
-                f"up to {tasks_per_array} tasks per array (MaxArraySize {max_array_size})."
+                f"up to {tasks_per_array} tasks per array (MaxArraySize {max_array_size}){running_desc}."
             )
         else:
             joblens = ", ".join(str(s) for s in chunk_sizes)
@@ -815,7 +839,10 @@ def main():
                 with tempfile.NamedTemporaryFile(mode="w", suffix=".sh") as sbash:
                     sbash.write(slurm_content)
                     sbash.flush()
-                    sbatch_command = f"sbatch --array=0-{len(group) - 1} --nice={args.nice} {sbash.name} "
+                    array_spec = f"0-{len(group) - 1}"
+                    if array_throttles[array_idx] is not None:
+                        array_spec += f"%{array_throttles[array_idx]}"
+                    sbatch_command = f"sbatch --array={array_spec} --nice={args.nice} {sbash.name} "
                     if args.sbatch_verbose:
                         print(f"\n--- sbatch array file {array_idx} ({len(group)} tasks), {sbash.name} ---\n")
                         subprocess.run(f"cat {sbash.name}", shell=True)

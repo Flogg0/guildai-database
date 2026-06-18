@@ -183,7 +183,8 @@ so they ship and version with this fork:
   `--shuffle` to randomize run order before chunking so long/short runs spread
   evenly across tasks rather than clumping; if the task count exceeds the
   cluster's `MaxArraySize` (auto-detected) it auto-splits across several arrays,
-  and `--num-arrays N` forces a specific count.
+  and `--num-arrays N` forces a specific count. `--max-running N` caps how many
+  tasks run at once overall (split across the arrays via SLURM's `%` throttle).
 - **`guild-stage-diagnose`** — measures the actual wall-clock cost of the
   operations staging performs, to locate the bottleneck on a given filesystem
   (esp. a cluster NAS): latency of filesystem primitives (stat, create+write,
