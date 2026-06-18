@@ -170,7 +170,16 @@ so they ship and version with this fork:
   workers so per-trial index writes become per-run dirty markers, then
   resyncs the index once after all trials are staged.
 - **`guild-slurm-runner`** — selects staged runs (by filter, ids, or a
-  JSON file) and either executes them directly or submits SLURM batch jobs.
+  JSON file) and either executes them directly (`--exec`) or submits them to
+  SLURM (`--sbatch`). Three submission shapes: the default writes one
+  independent sbatch job per chunk; `--job-array` packs all chunks into a
+  single SLURM job array (one job id, fixed chunk per task); and
+  `--shared-queue` submits an array of pull-workers that dynamically claim
+  runs from a shared, filesystem-backed queue (atomic `mkdir` claim markers,
+  tagged with the array generation for crash-safe **resume by resubmit**),
+  giving dynamic load balancing when run times vary. The shared queue lives
+  under `$GUILD_HOME/_slurm_queue` by default (override with `--queue-dir`);
+  set `--use-jobs N` to your max concurrency.
 - **`guild-stage-diagnose`** — measures the actual wall-clock cost of the
   operations staging performs, to locate the bottleneck on a given filesystem
   (esp. a cluster NAS): latency of filesystem primitives (stat, create+write,
