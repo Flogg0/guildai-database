@@ -179,7 +179,9 @@ so they ship and version with this fork:
   tagged with the array generation for crash-safe **resume by resubmit**),
   giving dynamic load balancing when run times vary. The shared queue lives
   under `$GUILD_HOME/_slurm_queue` by default (override with `--queue-dir`);
-  set `--use-jobs N` to your max concurrency.
+  set `--use-jobs N` to your max concurrency. With `--job-array`, add
+  `--shuffle` to randomize run order before chunking so long/short runs spread
+  evenly across tasks rather than clumping.
 - **`guild-stage-diagnose`** — measures the actual wall-clock cost of the
   operations staging performs, to locate the bottleneck on a given filesystem
   (esp. a cluster NAS): latency of filesystem primitives (stat, create+write,
