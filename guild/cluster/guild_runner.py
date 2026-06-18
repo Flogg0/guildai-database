@@ -674,7 +674,7 @@ def main():
         frac_num_jobs = nr_of_runs / worker_slots_per_slurmjob
         full_jobs = int(math.ceil(frac_num_jobs))
         nr_of_jobs = args.use_jobs
-        print(f"num jobs: {nr_of_runs}")
+        print(f"num runs: {nr_of_runs}")
         print(f"workers per slurmjob: {worker_slots_per_slurmjob}")
         if args.num_gpus > 0:
             if args.num_gpus > worker_slots_per_slurmjob:
@@ -711,10 +711,20 @@ def main():
         # Chunking
         nr_of_jobs_per_node = int(math.ceil(nr_of_runs / nr_of_jobs))
         chunks = list(chunk(runs, nr_of_jobs_per_node))
-        joblens = ", ".join([str(len(chunk_runs)) for chunk_runs in chunks])
-        print(f"jobs per node: [ {joblens} ]")
+        chunk_sizes = [len(chunk_runs) for chunk_runs in chunks]
         if args.job_array:
-            print(f"Submitting a single SLURM job array with {len(chunks)} tasks.")
+            # One array task per chunk; summarize instead of listing every chunk
+            # (the list would be thousands of entries for a large array). Each
+            # value is runs-per-task, and SLURM may pack several tasks per node.
+            lo, hi = min(chunk_sizes), max(chunk_sizes)
+            runs_per_task = f"{lo}" if lo == hi else f"{lo}-{hi}"
+            print(
+                f"Submitting a single SLURM job array: {len(chunks)} tasks, "
+                f"{runs_per_task} runs per task ({nr_of_runs} runs total)."
+            )
+        else:
+            joblens = ", ".join(str(s) for s in chunk_sizes)
+            print(f"jobs per node: [ {joblens} ]")
 
         if not args.sbatch_yes:
             if not yesno("Continue?"):
