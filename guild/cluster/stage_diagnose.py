@@ -365,7 +365,6 @@ def probe_stage_profile(operation_args, warmup=3):
     """
     import cProfile
     import pstats
-    from guild.commands.main import main as guild_cli
 
     real_runs = _runs_dir()
     parent = os.path.dirname(os.path.dirname(real_runs))
@@ -378,30 +377,34 @@ def probe_stage_profile(operation_args, warmup=3):
     op = operation_args[0]
     flags = " ".join(operation_args[1:])
     argv = ("run --yes %s --stage %s" % (op, flags)).split()
+    runs_dir = os.path.join(tmp_home, "runs")
 
-    def one_stage():
+    def _count():
         try:
-            guild_cli.main(args=list(argv), standalone_mode=False)
-        except SystemExit:
-            pass
-        except BaseException:
-            pass
+            return sum(1 for n in os.listdir(runs_dir) if len(n) == 32)
+        except OSError:
+            return 0
 
+    # Use the same verified-staging task as --compare-exec; profiling its own
+    # closure previously profiled a no-op (staged nothing) and reported a
+    # misleadingly tiny time.
     report = {}
     pr = cProfile.Profile()
     try:
         with contextlib.redirect_stdout(io.StringIO()), \
                 contextlib.redirect_stderr(io.StringIO()):
             t0 = time.perf_counter()
-            one_stage()
+            _diag_stage_task(argv)
             report["cold_stage_s"] = time.perf_counter() - t0
             for _ in range(max(0, warmup - 1)):
-                one_stage()
+                _diag_stage_task(argv)
+            c = _count()
             t0 = time.perf_counter()
             pr.enable()
-            one_stage()
+            _diag_stage_task(argv)
             pr.disable()
             report["warm_stage_s"] = time.perf_counter() - t0
+            report["profiled_staged"] = _count() - c
     finally:
         for k, v in prev.items():
             if v is None:
@@ -425,6 +428,9 @@ def _print_profile(report):
           % report.get("cold_stage_s", 0))
     print("  warm stage (profiled): %8.3f s   <- the per-trial cost that matters"
           % report.get("warm_stage_s", 0))
+    staged = report.get("profiled_staged", 0)
+    print("  profiled stage staged: %d run(s)%s" % (
+        staged, "" if staged == 1 else "   <-- WARNING: not 1; profile is NOT a real stage"))
     rows = report.get("rows", [])
 
     print("\n  Top 25 by SELF time (where the seconds are actually spent;")
