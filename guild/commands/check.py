@@ -83,6 +83,14 @@ def _ac_builtin_tests(ctx, _param, incomplete):
 )
 @click.option("-v", "--verbose", help="Show more information.", is_flag=True)
 @click.option("--space", help="Show disk space usage for Guild files.", is_flag=True)
+@click.option(
+    "--rebuild-index",
+    is_flag=True,
+    help=(
+        "Delete and rebuild the run index from scratch. Use to clear a stale "
+        "index left by an older version."
+    ),
+)
 @click.option("--version", metavar="REQUIRED", help="Check the installed version.")
 @click.option(
     "--notify", is_flag=True, help="Send system notification when check is complete."

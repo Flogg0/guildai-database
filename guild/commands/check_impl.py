@@ -83,10 +83,20 @@ def _check_config():
 
 
 def main(args):
+    if args.rebuild_index:
+        _rebuild_index_and_exit()
     if args.remote:
         remote_impl_support.check(args)
     else:
         _check(args)
+
+
+def _rebuild_index_and_exit():
+    from guild import var
+    cli.out("Rebuilding run index...", err=True)
+    var.rebuild_index()
+    cli.out("Run index rebuilt.", err=True)
+    raise SystemExit(0)
 
 
 def _check(args):

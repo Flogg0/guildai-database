@@ -742,6 +742,38 @@ def index_sync(root=None):
     _index_safe_write(lambda: _do_index_sync(conn, root, add_only=False), root)
 
 
+def _clear_dirty_markers(root):
+    """Remove the global and all per-run dirty markers under root."""
+    try:
+        os.remove(_dirty_marker_path(root))
+    except OSError:
+        pass
+    d = _dirty_runs_dir(root)
+    try:
+        for name in os.listdir(d):
+            try:
+                os.remove(os.path.join(d, name))
+            except OSError:
+                pass
+    except OSError:
+        pass
+
+
+def rebuild_index(root=None):
+    """Delete the index DB and rebuild it from scratch by scanning every run
+    dir under root.
+
+    Unlike index_sync (which reuses the existing DB file), this drops the DB
+    entirely first, so it also clears a stale schema or leftover rows from an
+    older index format. Dirty/sync markers are cleared too, leaving a pristine,
+    freshly-synced index.
+    """
+    root = root or runs_dir()
+    _nuke_index(root)
+    _clear_dirty_markers(root)
+    index_sync(root)
+
+
 def _index_upsert_run(conn, run):
     from guild import run_util
 
@@ -1405,8 +1437,19 @@ def delete_runs(runs, permanent=False):
 
 
 def purge_runs(runs):
+    to_remove_from_trash = []
     for run in runs:
         _delete_run(run.dir)
+        to_remove_from_trash.append(run.id)
+    # Drop the purged runs from the trash index, mirroring restore_runs. Without
+    # this the trash index keeps listing runs whose dirs are gone, so every
+    # later trash op (purge/list --deleted/restore) re-reads and re-syncs a
+    # bloated index.
+    if to_remove_from_trash:
+        trash_root = runs_dir(deleted=True)
+        with index_batch_writes(root=trash_root):
+            for run_id in to_remove_from_trash:
+                index_remove_run(run_id, trash_root)
 
 
 def _delete_run(src):
