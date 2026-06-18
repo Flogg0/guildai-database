@@ -150,16 +150,27 @@ def _dirty_runs_dir(root=None):
     return _index_db_path(root) + ".dirty.d"
 
 
+_dirty_runs_dir_ensured = set()
+
+
 def _touch_run_dirty_marker(root, run_id):
     """Mark a single run as needing resync. Workers call this per write
     instead of touching the global dirty marker, so the headnode can do a
     delta sync over only the touched runs.
     """
-    d = _dirty_runs_dir(root)
-    try:
-        os.makedirs(d, exist_ok=True)
-    except OSError:
+    # Run ids are always 32-char hex (runlib.mkid). Skip anything else -- e.g.
+    # the proto sub-run, which is not a queryable run; it would only create a
+    # marker that _list_dirty_run_markers ignores, one wasted NFS write per
+    # stage.
+    if not run_id or len(run_id) != 32:
         return
+    d = _dirty_runs_dir(root)
+    if d not in _dirty_runs_dir_ensured:
+        try:
+            os.makedirs(d, exist_ok=True)
+        except OSError:
+            return
+        _dirty_runs_dir_ensured.add(d)
     path = os.path.join(d, run_id)
     try:
         with open(path, "a"):
@@ -246,7 +257,8 @@ def _nuke_index(root=None):
 
 def _init_index_schema(conn):
     conn.execute("PRAGMA journal_mode=DELETE")
-    conn.execute("PRAGMA synchronous=NORMAL")
+    # synchronous=OFF is set in _connect_db (per-connection); see the rationale
+    # there. The index is a derived cache, so dropping commit fsyncs is safe.
     conn.execute(
         "CREATE TABLE IF NOT EXISTS runs ("
         "  run_id TEXT PRIMARY KEY,"
@@ -270,6 +282,12 @@ def _init_index_schema(conn):
 def _connect_db(db_path):
     conn = sqlite3.connect(db_path, timeout=300)
     conn.execute("PRAGMA busy_timeout=300000")
+    # synchronous is per-connection, not stored in the DB file, so it must be
+    # set on every connection -- including the fast/cached paths that skip
+    # _init_index_schema -- or commits keep fsyncing. OFF is safe here: the
+    # index is a derived cache, rebuilt on corruption and refreshed via dirty
+    # markers (see _init_index_schema).
+    conn.execute("PRAGMA synchronous=OFF")
     return conn
 
 

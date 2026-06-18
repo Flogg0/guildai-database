@@ -421,6 +421,9 @@ class Run:
 
     def init_skel(self):
         util.ensure_dir(self.guild_path("attrs"))
+        # `.guild` now exists (ensure_dir created attrs under it); let later
+        # marker writes skip their redundant ensure_dir on this run object.
+        self._guild_dir_ensured = True
         if not self.has_attr("initialized"):
             self.write_attr("id", self.id)
             self.write_attr("initialized", timestamp())

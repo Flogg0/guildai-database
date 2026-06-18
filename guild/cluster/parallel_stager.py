@@ -1,6 +1,7 @@
 import argparse
 import contextlib
 import io
+import os
 import shlex
 import subprocess
 import sys
@@ -51,6 +52,11 @@ def _stage_in_process(command):
     skips that startup. Behaviour is unchanged: same argv, same exit
     semantics (a non-zero guild exit raises, like subprocess.check_call).
     """
+    # Staging is a bulk pre-step: skip the per-trial SQLite index write (a
+    # journaled transaction on one shared NFS file that every worker contends
+    # on). In writes-disabled mode guild drops a per-run dirty marker instead;
+    # _resync_index() folds them into the index once after staging.
+    os.environ["GUILD_NO_INDEX_WRITES"] = "1"
     from guild.commands.main import main as guild_cli
 
     argv = shlex.split(command)
@@ -80,6 +86,23 @@ def parallel_stage_trials(trial_commands, n_jobs=None):
     jobs = [joblib.delayed(_stage_in_process)(command) for command in trial_commands]
     result = joblib.Parallel(n_jobs=n_jobs)(tqdm.tqdm(jobs))
     return result
+
+
+def _resync_index():
+    """Fold the per-run dirty markers left by writes-disabled staging into the
+    SQLite index in a single delta sync, so the index is consistent when
+    staging returns instead of resyncing lazily on the user's next command.
+
+    Writes must be enabled here (pop the worker flag in case a non-process
+    joblib backend set it in this process); opening the index with fresh
+    markers present triggers the delta sync over only the staged runs.
+    """
+    os.environ.pop("GUILD_NO_INDEX_WRITES", None)
+    try:
+        from guild import var
+        var._get_index_conn()
+    except Exception as e:
+        print(f"Index resync after staging failed (will resync on next read): {e}")
 
 
 def split_list(the_list, the_element, other=None):
@@ -141,6 +164,7 @@ def main():
 
     if not pargs.dry_run:
         parallel_stage_trials(trial_commands, n_jobs=pargs.n_jobs)
+        _resync_index()
 
 
 if __name__ == "__main__":
