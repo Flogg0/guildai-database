@@ -149,6 +149,17 @@ def get_user_and_group():
 #         pass
 
 
+def get_max_array_size(default=1000):
+    """Query SLURM's MaxArraySize so big job arrays can be split to fit it.
+    Falls back to a conservative default if scontrol is unavailable."""
+    try:
+        out = subprocess.check_output(["scontrol", "show", "config"], text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return default
+    match = re.search(r"MaxArraySize\s*=\s*(\d+)", out)
+    return int(match.group(1)) if match else default
+
+
 def resolve_cuda_visible_devices(number_of_gpus):
     """Read CUDA_VISIBLE_DEVICES from the environment and validate it against the
     number of GPUs the job requested."""
@@ -487,6 +498,25 @@ def main():
         ),
     )
     parser.add_argument(
+        "--num-arrays",
+        type=int,
+        default=0,
+        help=(
+            "With --job-array, split the tasks across this many SLURM job arrays "
+            "(default: auto -- the minimum needed to keep each array within "
+            "--max-array-size). Use to spread a large run set over a few arrays."
+        ),
+    )
+    parser.add_argument(
+        "--max-array-size",
+        type=int,
+        default=0,
+        help=(
+            "Max tasks per SLURM job array (default: auto-detect the cluster's "
+            "MaxArraySize via scontrol). --job-array auto-splits to stay within it."
+        ),
+    )
+    parser.add_argument(
         "--shared-queue",
         action="store_true",
         help=(
@@ -713,14 +743,31 @@ def main():
         chunks = list(chunk(runs, nr_of_jobs_per_node))
         chunk_sizes = [len(chunk_runs) for chunk_runs in chunks]
         if args.job_array:
-            # One array task per chunk; summarize instead of listing every chunk
-            # (the list would be thousands of entries for a large array). Each
+            # One array task per chunk. Split the tasks across one or more SLURM
+            # job arrays so no array exceeds the cluster's MaxArraySize and so the
+            # user can ask for a specific number of arrays.
+            max_array_size = args.max_array_size if args.max_array_size > 0 else get_max_array_size()
+            num_tasks = len(chunks)
+            if args.num_arrays > 0:
+                num_arrays = args.num_arrays
+                if int(math.ceil(num_tasks / num_arrays)) > max_array_size:
+                    parser.error(
+                        f"{num_tasks} tasks across {args.num_arrays} array(s) needs "
+                        f"{int(math.ceil(num_tasks / num_arrays))} tasks/array, over MaxArraySize "
+                        f"({max_array_size}); use more --num-arrays or fewer tasks (--use-jobs)."
+                    )
+            else:
+                num_arrays = max(1, int(math.ceil(num_tasks / max_array_size)))
+            tasks_per_array = int(math.ceil(num_tasks / num_arrays))
+            array_groups = list(chunk(chunks, tasks_per_array))
+            # Summarize instead of listing every chunk (could be thousands). Each
             # value is runs-per-task, and SLURM may pack several tasks per node.
             lo, hi = min(chunk_sizes), max(chunk_sizes)
             runs_per_task = f"{lo}" if lo == hi else f"{lo}-{hi}"
             print(
-                f"Submitting a single SLURM job array: {len(chunks)} tasks, "
-                f"{runs_per_task} runs per task ({nr_of_runs} runs total)."
+                f"Submitting {len(array_groups)} SLURM job array(s): {num_tasks} tasks total, "
+                f"{runs_per_task} runs per task ({nr_of_runs} runs total), "
+                f"up to {tasks_per_array} tasks per array (MaxArraySize {max_array_size})."
             )
         else:
             joblens = ", ".join(str(s) for s in chunk_sizes)
@@ -731,48 +778,55 @@ def main():
                 sys.exit(-1)
 
         if args.job_array:
-            # Each array task selects its own chunk of run ids via $SLURM_ARRAY_TASK_ID.
-            # The chunks are embedded directly in the script as a bash array, so no
-            # extra files need to persist on shared storage until the tasks run.
-            chunk_runid_strings = [" ".join(run["id"] for run in chunk_runs) for chunk_runs in chunks]
-            bash_array_body = "\n".join(shlex.quote(s) for s in chunk_runid_strings)
-            array_preamble = (
-                "RUNID_CHUNKS=(\n"
-                f"{bash_array_body}\n"
-                ")\n"
-                'export CHUNK_RUNIDS="${RUNID_CHUNKS[$SLURM_ARRAY_TASK_ID]}"\n'
-                'echo "array task ${SLURM_ARRAY_TASK_ID}: ${CHUNK_RUNIDS}"\n'
-            )
-            inner_command = (
-                f"{sys.executable} {__file__} --exec {flags_passthrough_string} --runids $CHUNK_RUNIDS"
-                f" --workers-per-job {args.workers_per_job} --num-gpus {args.num_gpus} --num-cpus {args.num_cpus}"
-            )
-            if is_in_singularity():
-                # CHUNK_RUNIDS is exported above, so it is inherited inside the container.
-                inner_command = with_singularity(inner_command)
-            command = array_preamble + inner_command
-            slurm_content = slurm_template.substitute(
-                user=username,
-                cmd=command,
-                jobname=args.jobname,
-                guild_home=guild_home,
-                num_gpus=args.num_gpus,
-                num_cores=args.num_cpus,
-                partition=args.partition,
-                exclude_nodes=args.exclude_nodes,
-                group=groupname,
-            )
-            with tempfile.NamedTemporaryFile(mode="w", suffix=".sh") as sbash:
-                sbash.write(slurm_content)
-                sbash.flush()
-                sbatch_command = f"sbatch --array=0-{len(chunks) - 1} --nice={args.nice} {sbash.name} "
-                if args.sbatch_verbose:
-                    print(f"\n--- sbatch array file, {sbash.name} ---\n")
-                    subprocess.run(f"cat {sbash.name}", shell=True)
-                print(f"command: {sbatch_command}")
-                if not args.dry_run:
-                    subprocess.run(sbatch_command, shell=True)
-            print(f"\n=== submitted 1 job array with {len(chunks)} tasks ===\n")
+            # Each array task selects its own chunk of run ids via $SLURM_ARRAY_TASK_ID
+            # (0-based within its array). The chunks are embedded directly in the script
+            # as a bash array, so nothing needs to persist on shared storage.
+            multiple = len(array_groups) > 1
+            for array_idx, group in enumerate(array_groups):
+                chunk_runid_strings = [" ".join(run["id"] for run in chunk_runs) for chunk_runs in group]
+                bash_array_body = "\n".join(shlex.quote(s) for s in chunk_runid_strings)
+                array_preamble = (
+                    "RUNID_CHUNKS=(\n"
+                    f"{bash_array_body}\n"
+                    ")\n"
+                    'export CHUNK_RUNIDS="${RUNID_CHUNKS[$SLURM_ARRAY_TASK_ID]}"\n'
+                    'echo "array task ${SLURM_ARRAY_TASK_ID}: ${CHUNK_RUNIDS}"\n'
+                )
+                inner_command = (
+                    f"{sys.executable} {__file__} --exec {flags_passthrough_string} --runids $CHUNK_RUNIDS"
+                    f" --workers-per-job {args.workers_per_job} --num-gpus {args.num_gpus} --num-cpus {args.num_cpus}"
+                )
+                if is_in_singularity():
+                    # CHUNK_RUNIDS is exported above, so it is inherited inside the container.
+                    inner_command = with_singularity(inner_command)
+                command = array_preamble + inner_command
+                jobname = f"{args.jobname}-{array_idx}" if multiple else args.jobname
+                slurm_content = slurm_template.substitute(
+                    user=username,
+                    cmd=command,
+                    jobname=jobname,
+                    guild_home=guild_home,
+                    num_gpus=args.num_gpus,
+                    num_cores=args.num_cpus,
+                    partition=args.partition,
+                    exclude_nodes=args.exclude_nodes,
+                    group=groupname,
+                )
+                with tempfile.NamedTemporaryFile(mode="w", suffix=".sh") as sbash:
+                    sbash.write(slurm_content)
+                    sbash.flush()
+                    sbatch_command = f"sbatch --array=0-{len(group) - 1} --nice={args.nice} {sbash.name} "
+                    if args.sbatch_verbose:
+                        print(f"\n--- sbatch array file {array_idx} ({len(group)} tasks), {sbash.name} ---\n")
+                        subprocess.run(f"cat {sbash.name}", shell=True)
+                    print(f"command: {sbatch_command}")
+                    if not args.dry_run:
+                        result = subprocess.run(sbatch_command, shell=True)
+                        if result.returncode != 0:
+                            raise RuntimeError(f"sbatch failed (rc={result.returncode}) for job array {array_idx}")
+                if array_idx < len(array_groups) - 1:
+                    time.sleep(args.delay_start)
+            print(f"\n=== submitted {len(array_groups)} job array(s), {len(chunks)} tasks total ===\n")
             return
 
         for i, chunk_runs in tqdm.tqdm(list(enumerate(chunks))):
