@@ -673,15 +673,34 @@ def write_sourcecode_digest(run):
     run.write_attr("sourcecode_digest", digest)
 
 
-def write_vcs_commit(run, project_dir):
+def vcs_commit_for_dir(project_dir):
+    """The formatted vcs_commit attr value for project_dir, or None.
+
+    Computing this shells out to git, including a `git status` working-tree walk
+    that is expensive on networked filesystems. Callers that stage many runs
+    from one project (e.g. the parallel stager) can call this once and pass the
+    result to all runs via GUILD_VCS_COMMIT instead of recomputing per run.
+    """
     try:
         commit, status = vcs_util.commit_for_dir(project_dir)
     except vcs_util.NoCommit:
-        pass
+        return None
     except vcs_util.CommitReadError as e:
         log.warning("error reading VCS commit: %s", e)
-    else:
-        run.write_attr("vcs_commit", _format_vcs_commit(commit, status))
+        return None
+    return _format_vcs_commit(commit, status)
+
+
+def write_vcs_commit(run, project_dir):
+    # A precomputed value in GUILD_VCS_COMMIT (set once by a batch stager)
+    # avoids re-running `git status` over the project tree for every run.
+    override = os.environ.get("GUILD_VCS_COMMIT")
+    if override:
+        run.write_attr("vcs_commit", override)
+        return
+    val = vcs_commit_for_dir(project_dir)
+    if val is not None:
+        run.write_attr("vcs_commit", val)
 
 
 def _format_vcs_commit(commit, status):

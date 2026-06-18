@@ -88,6 +88,25 @@ def parallel_stage_trials(trial_commands, n_jobs=None):
     return result
 
 
+def _precompute_vcs_commit():
+    """Compute the project's VCS commit once and expose it to staging workers
+    via GUILD_VCS_COMMIT, so each trial reuses it instead of re-running
+    `git status` (a full working-tree walk) per stage -- the dominant per-trial
+    cost on a networked filesystem. The commit/status can't change during a
+    staging run, so one computation is correct for all trials.
+    """
+    if os.environ.get("GUILD_VCS_COMMIT") or os.environ.get("NO_VCS_COMMIT") == "1":
+        return
+    try:
+        from guild import config, op_util
+        val = op_util.vcs_commit_for_dir(config.cwd())
+    except Exception as e:
+        print(f"VCS commit precompute skipped: {e}")
+        return
+    if val:
+        os.environ["GUILD_VCS_COMMIT"] = val
+
+
 def _resync_index():
     """Fold the per-run dirty markers left by writes-disabled staging into the
     SQLite index in a single delta sync, so the index is consistent when
@@ -163,6 +182,7 @@ def main():
         sys.exit(-1)
 
     if not pargs.dry_run:
+        _precompute_vcs_commit()
         parallel_stage_trials(trial_commands, n_jobs=pargs.n_jobs)
         _resync_index()
 
