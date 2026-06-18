@@ -644,7 +644,13 @@ def init_run(path=None):
 
 
 def set_run_marker(run, marker):
-    util.ensure_dir(run.guild_path())
+    # `.guild` is created once at run init (init_run); avoid re-running
+    # ensure_dir (realpath + makedirs => several NFS stats) on every marker
+    # write to the same run. Absent the flag we fall back to ensure_dir, so
+    # callers that don't go through init_run keep working unchanged.
+    if not getattr(run, "_guild_dir_ensured", False):
+        util.ensure_dir(run.guild_path())
+        run._guild_dir_ensured = True
     open(run.guild_path(marker), "w").close()
 
 

@@ -42,6 +42,7 @@ See design notes in `guild.guildfile` and `guild.op_util` module
 source code for similar thoughts.
 """
 
+import copy
 import hashlib
 import json
 import logging
@@ -223,6 +224,11 @@ def _tags_for_python_script(name):
     return None
 
 
+# cache_path -> (source_mod_mtime, flags_data). Process-level memo for
+# _cached_data; see the rationale there.
+_flags_data_mem = {}
+
+
 class PythonScriptPlugin(pluginlib.Plugin):
     resolve_model_op_priority = 60
 
@@ -304,11 +310,27 @@ class PythonScriptPlugin(pluginlib.Plugin):
 
     def _cached_data(self, mod_path, base_args):
         cached_path = self._cached_data_path(mod_path, base_args)
+        # Process-level memo: guildfile_loaded validates this same cache file
+        # once per opdef (e.g. 21x when many ops share a script) and reloads it
+        # on every stage. Each validation is exists()+getmtime() stats on the
+        # cache file -- pure NFS round-trips. Memoize by cache_path, guarded by
+        # the source module's mtime so edits still invalidate. Return a deep
+        # copy: callers mutate the dict (e.g. _apply_flags_dest pops "$dest").
+        try:
+            mod_mtime = os.path.getmtime(mod_path)
+        except OSError:
+            mod_mtime = None
+        mem = _flags_data_mem.get(cached_path)
+        if mem is not None and mod_mtime is not None and mem[0] == mod_mtime:
+            return copy.deepcopy(mem[1]), cached_path
         if self._cache_valid(cached_path, mod_path):
             with open(cached_path, "r") as f:
                 # Use yaml to avoid json's insistence on treating
                 # strings as unicode.
-                return yaml.safe_load(f), cached_path
+                data = yaml.safe_load(f)
+            if mod_mtime is not None:
+                _flags_data_mem[cached_path] = (mod_mtime, copy.deepcopy(data))
+            return data, cached_path
         return None, cached_path
 
     @staticmethod
