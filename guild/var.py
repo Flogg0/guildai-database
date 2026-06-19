@@ -708,6 +708,46 @@ def _do_index_sync(conn, root, add_only=False):
     _write_sync_marker(root)
 
 
+def _resync_workers(n_items):
+    """Number of threads for the sync read phase.
+
+    Serial by default: threading only wins when the per-run reads are
+    filesystem-latency bound (a networked FS, where blocking round-trips release
+    the GIL and overlap). On a local disk the reads are CPU bound (opref/YAML
+    parsing under the GIL) and threads only add contention -- so this is an
+    opt-in for cluster/NAS staging via GUILD_RESYNC_WORKERS (e.g. 16).
+    """
+    try:
+        n = int(os.environ.get("GUILD_RESYNC_WORKERS", "1"))
+    except ValueError:
+        n = 1
+    return max(1, min(n, n_items))
+
+
+def _parallel_read(fn, items):
+    """Map fn over items, returning results in order.
+
+    Runs in worker threads with the dirty-sync guard set so Run reads take the
+    pure-filesystem path (no index DB access) and stay thread-safe. Falls back
+    to a serial loop for small batches where thread overhead wouldn't pay off.
+    """
+    items = list(items)
+    workers = _resync_workers(len(items))
+    if workers <= 1 or len(items) < 64:
+        return [fn(it) for it in items]
+
+    import concurrent.futures
+
+    def _worker(it):
+        # Per-thread: take the FS-fallback path in Run._ensure_index_row so we
+        # never re-enter _get_index_conn from a worker thread.
+        _index_local.in_dirty_sync = True
+        return fn(it)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as ex:
+        return list(ex.map(_worker, items))
+
+
 def _do_delta_sync(conn, root, markers):
     """Upsert only the runs listed in `markers`, then clear each marker.
 
@@ -721,16 +761,29 @@ def _do_delta_sync(conn, root, markers):
     while we're processing, it survives the clear and the next read will
     pick it up.
     """
-    for run_id, mtime in markers:
+    # Read phase (parallel): classify each marker and, for live runs, read the
+    # run from disk into its index row. These reads are per-run opref/attrs file
+    # reads -- on a networked filesystem each is a serial round-trip, so the
+    # sync is latency-bound. Fan the reads out across threads (the GIL is
+    # released during the blocking FS calls) so round-trips overlap. The DB
+    # writes stay serial in the parent (sqlite conn is single-threaded).
+    def _read(item):
+        run_id, mtime = item
         path = os.path.join(root, run_id)
         if not os.path.isdir(path) or not _opref_exists(path):
-            conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
-            _clear_run_dirty_marker_if_unchanged(root, run_id, mtime)
-            continue
+            return ("delete", run_id, mtime, None)
         if not _has_definitive_status(path):
+            return ("skip", run_id, mtime, None)
+        row = _index_run_row(runlib.Run(run_id, path))
+        return ("upsert", run_id, mtime, row)
+
+    for kind, run_id, mtime, row in _parallel_read(_read, markers):
+        if kind == "skip":
             continue
-        run = runlib.Run(run_id, path)
-        _index_upsert_run(conn, run)
+        if kind == "delete":
+            conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
+        else:
+            _index_upsert_row(conn, row)
         _clear_run_dirty_marker_if_unchanged(root, run_id, mtime)
     conn.commit()
 
@@ -774,7 +827,12 @@ def rebuild_index(root=None):
     index_sync(root)
 
 
-def _index_upsert_run(conn, run):
+def _index_run_row(run):
+    """Read a run from disk and build its index row tuple.
+
+    Pure reads (opref + attrs), no DB access, so this can run in worker
+    threads during a sync's parallel read phase.
+    """
     from guild import run_util
 
     opref_str = ""
@@ -805,12 +863,20 @@ def _index_upsert_run(conn, run):
             tags = json.dumps(t)
     except Exception:
         pass
+    return (run.id, status, opref_str, op_name, started, initialized, label, flags, tags)
+
+
+def _index_upsert_row(conn, row):
     conn.execute(
         "INSERT OR REPLACE INTO runs "
         "(run_id, status, opref, op_name, started, initialized, label, flags, tags) "
         "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        (run.id, status, opref_str, op_name, started, initialized, label, flags, tags),
+        row,
     )
+
+
+def _index_upsert_run(conn, run):
+    _index_upsert_row(conn, _index_run_row(run))
 
 
 def index_update_status(run, status, root=None):
