@@ -5,6 +5,7 @@ guild-parallel-stager = guild.cluster.parallel_stager:main
 guild-slurm-runner = guild.cluster.guild_runner:main
 guild-utils-stager = guild.cluster.old_stager:main
 guild-stage-diagnose = guild.cluster.stage_diagnose:main
+guild-slurm-jobcount = guild.cluster.job_count:main
 
 [guild.plugins]
 

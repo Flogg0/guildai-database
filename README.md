@@ -185,6 +185,13 @@ so they ship and version with this fork:
   cluster's `MaxArraySize` (auto-detected) it auto-splits across several arrays,
   and `--num-arrays N` forces a specific count. `--max-running N` caps how many
   tasks run at once overall (split across the arrays via SLURM's `%` throttle).
+- **`guild-slurm-jobcount`** — prints how many of a user's SLURM jobs are
+  still left to finish, parsing `squeue` text output (`guild-slurm-jobcount
+  [USER]`; the user defaults to `$USER`). It is **job-array aware**: running array tasks are listed one per
+  line, but pending tasks are collapsed by `squeue` into ranges
+  (`1234_[5-100]`, `1234_[5-100%4]`, `1234_[5,7,9-12]`), so it expands those
+  ranges to count each task once. Add `--running`/`-r` to count only the jobs
+  currently running instead of everything still queued.
 - **`guild-stage-diagnose`** — measures the actual wall-clock cost of the
   operations staging performs, to locate the bottleneck on a given filesystem
   (esp. a cluster NAS): latency of filesystem primitives (stat, create+write,
