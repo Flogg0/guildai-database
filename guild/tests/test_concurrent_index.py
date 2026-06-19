@@ -1355,6 +1355,56 @@ def test_per_run_marker_survives_in_flight():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_parallel_delta_sync_matches_serial():
+    """The threaded read phase (GUILD_RESYNC_WORKERS>1) must index the same
+    rows as a serial sync. Uses >=64 dirty runs so the parallel path engages."""
+    print(f"\n=== Test: parallel delta sync matches serial ===")
+
+    def _sync_rows(workers):
+        tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+        runs_dir_path = os.path.join(tmpdir, "runs")
+        os.makedirs(runs_dir_path, exist_ok=True)
+        os.environ["GUILD_HOME"] = tmpdir
+        os.environ["GUILD_RESYNC_WORKERS"] = str(workers)
+        for mod in list(sys.modules):
+            if mod.startswith("guild"):
+                sys.modules.pop(mod, None)
+        from guild import var as gvar
+        from guild import run as runlib
+        try:
+            # Stage 100 runs worker-style: build dirs + per-run dirty markers,
+            # but no index writes -- exactly what the resync folds in.
+            os.environ["GUILD_NO_INDEX_WRITES"] = "1"
+            n = 100
+            for i in range(n):
+                run_id = f"{i:032d}"
+                _make_run_dir(runs_dir_path, run_id, status="completed",
+                              flags={"seed": i})
+                gvar._touch_run_dirty_marker(runs_dir_path, run_id)
+            os.environ.pop("GUILD_NO_INDEX_WRITES", None)
+            gvar._drop_cached_conn(f"conn_{gvar._index_db_path(runs_dir_path)}")
+            conn = gvar._get_index_conn(runs_dir_path)
+            return conn.execute(
+                "SELECT run_id, status, opref, op_name, started, initialized,"
+                " label, flags, tags FROM runs ORDER BY run_id"
+            ).fetchall()
+        finally:
+            os.environ.pop("GUILD_RESYNC_WORKERS", None)
+            os.environ.pop("GUILD_NO_INDEX_WRITES", None)
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+    try:
+        serial = _sync_rows(1)
+        parallel = _sync_rows(8)
+        assert len(serial) == 100, f"serial indexed {len(serial)} runs, want 100"
+        assert serial == parallel, "parallel sync rows differ from serial"
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+
+
 if __name__ == "__main__":
     mp.set_start_method("fork", force=True)
     results = {}
@@ -1377,6 +1427,7 @@ if __name__ == "__main__":
     results["unindexable_core_attr_falls_back"] = test_unindexable_core_attr_falls_back()
     results["per_run_marker_triggers_delta_sync"] = test_per_run_marker_triggers_delta_sync()
     results["per_run_marker_survives_in_flight"] = test_per_run_marker_survives_in_flight()
+    results["parallel_delta_sync_matches_serial"] = test_parallel_delta_sync_matches_serial()
 
     print("\n" + "=" * 50)
     print("SUMMARY:")

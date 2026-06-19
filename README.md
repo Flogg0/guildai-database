@@ -115,6 +115,32 @@ degrade to `error` via a local-PID check. The per-run marker for an
 in-flight run is left in place so the next sync retries after the worker
 writes `exit_status`.
 
+### Parallelizing the resync read phase: `GUILD_RESYNC_WORKERS`
+
+After a large staging batch the reconciling resync becomes the dominant
+cost: it reopens the index and reads every dirty run from disk to build its
+index row (opref + attrs). On a networked filesystem each run is a handful
+of serial metadata round-trips (~14 `stat` + ~7 `open` per run, measured),
+and the sync walks them one run at a time, so it is **latency-bound**.
+
+Set `GUILD_RESYNC_WORKERS=N` (e.g. `16`) to fan the *read* phase out across
+`N` threads. The blocking filesystem calls release the GIL, so the per-run
+round-trips overlap; the SQLite writes stay serial in the parent (the
+connection is single-threaded), so the index result is byte-for-byte
+identical to a serial sync. Each worker thread takes the dirty-sync
+filesystem-fallback path, so a worker read never re-enters the index DB.
+
+- **Off by default (serial).** Threading only wins when reads are
+  filesystem-latency bound. On a *local* disk the reads are CPU bound
+  (opref/YAML parsing under the GIL) and extra threads only add contention
+  — measurably *slower*. So this is an opt-in for cluster/NAS staging; set
+  it in the staging job's environment, not globally.
+- Modeling NAS latency (~37 ms of round-trips per run), 600 runs resynced
+  in **22.6 s serial → 1.5 s with 16 threads** (~15×), with identical index
+  output. Speedup is near-linear up to ~16 threads, then tapers.
+- Only engages for batches of ≥64 dirty runs; smaller (interactive) syncs
+  stay serial regardless, since thread setup wouldn't pay off.
+
 ## Rebuilding the index
 
 `guild check --rebuild-index` deletes the index DB and rebuilds it from
