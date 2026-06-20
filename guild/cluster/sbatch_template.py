@@ -15,6 +15,7 @@ DEFAULT_TEMPLATES = {
 #SBATCH --gres gpu:${num_gpus} # number of gpus
 #SBATCH -o /scratch/${user}/slurm_logs/slurm.%N.%j.out # STDOUT
 #SBATCH -e /scratch/${user}/slurm_logs/slurm.%N.%j.err # STDERR
+${timelimit}
 
 printenv
 $guild_home

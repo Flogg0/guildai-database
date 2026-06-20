@@ -464,6 +464,13 @@ def main():
 
     parser.add_argument("--partition", type=str, default="IFIgpu")
     parser.add_argument("--exclude-nodes", type=str, default="headnode")
+    parser.add_argument(
+        "--time",
+        type=str,
+        default=None,
+        help="Slurm wall-clock time limit (e.g. '24:00:00' or '1-00:00:00'). "
+        "Omit to use the partition default.",
+    )
     parser.add_argument("--guild-home", type=str, default=None, help="GUILD_HOME directory")
 
     # sbatch additional parameters
@@ -583,6 +590,18 @@ def main():
     else:
         guild_home = ""
 
+    if args.time:
+        # Accept the slurm wall-clock formats: minutes, MM:SS, HH:MM:SS,
+        # D-HH, D-HH:MM, D-HH:MM:SS.
+        if not re.fullmatch(r"\d+(:\d+){0,2}|\d+-\d+(:\d+){0,2}", args.time):
+            parser.error(
+                f"invalid --time '{args.time}'; expected a slurm time limit like "
+                "'24:00:00', '90' (minutes), or '1-00:00:00'"
+            )
+        timelimit = f"#SBATCH --time={args.time}"
+    else:
+        timelimit = ""
+
     # sbatch templates
     if args.list_templates:
         SlurmTemplate.print_defaults()
@@ -685,6 +704,7 @@ def main():
                 cmd=command,
                 jobname=args.jobname,
                 guild_home=guild_home,
+                timelimit=timelimit,
                 num_gpus=args.num_gpus,
                 num_cores=args.num_cpus,
                 partition=args.partition,
@@ -830,6 +850,7 @@ def main():
                     cmd=command,
                     jobname=jobname,
                     guild_home=guild_home,
+                    timelimit=timelimit,
                     num_gpus=args.num_gpus,
                     num_cores=args.num_cpus,
                     partition=args.partition,
@@ -866,6 +887,7 @@ def main():
                 cmd=command,
                 jobname=f"{args.jobname}-{i}",
                 guild_home=guild_home,
+                timelimit=timelimit,
                 num_gpus=args.num_gpus,
                 num_cores=args.num_cpus,
                 partition=args.partition,
