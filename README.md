@@ -211,6 +211,9 @@ so they ship and version with this fork:
   cluster's `MaxArraySize` (auto-detected) it auto-splits across several arrays,
   and `--num-arrays N` forces a specific count. `--max-running N` caps how many
   tasks run at once overall (split across the arrays via SLURM's `%` throttle).
+  `--time` sets a SLURM wall-clock limit (e.g. `24:00:00` or `1-00:00:00`,
+  validated against the accepted formats) by injecting `#SBATCH --time` into the
+  sbatch template; omit it to use the partition default.
 - **`guild-slurm-jobcount`** — prints how many of a user's SLURM jobs are
   still left to finish, parsing `squeue` text output (`guild-slurm-jobcount
   [USER]`; the user defaults to `$USER`). It is **job-array aware**: running array tasks are listed one per
