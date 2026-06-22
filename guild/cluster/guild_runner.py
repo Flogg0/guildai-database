@@ -442,6 +442,17 @@ def main():
     )
 
     parser.add_argument("--store-runs", type=str, default=None, help="filename to write filtered runs to")
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=0,
+        help=(
+            "Process at most this many runs in one invocation (the first N after "
+            "any --shuffle). Use to stay within the cluster's job/array limits "
+            "(can't submit more than ~10000 at once): run repeatedly to drain the "
+            "rest in batches. 0 = no limit."
+        ),
+    )
 
     group_execute = parser.add_mutually_exclusive_group()
     group_execute.add_argument("--sbatch", action="store_true")
@@ -580,6 +591,9 @@ def main():
     if args.shared_queue and args.job_array:
         parser.error("--shared-queue and --job-array are mutually exclusive")
 
+    if args.limit < 0:
+        parser.error("--limit must be >= 0 (0 = no limit)")
+
     if args.use_mps and not args.convert_cuda_visible_uuids:
         print("NOTE: '--use-mps' implies  '--convert-cuda-visible-uuids'")
         args.convert_cuda_visible_uuids = True
@@ -626,6 +640,15 @@ def main():
         # Randomize before chunking so hard runs are spread evenly across the
         # job-array tasks instead of clumping into a few unlucky chunks.
         random.shuffle(runs)
+
+    if args.limit and runs and len(runs) > args.limit:
+        # Cap how many runs we submit in one go (after --shuffle, so it's a
+        # random subset rather than always the same head). The cluster won't
+        # accept more than ~10000 jobs/array tasks at once; re-run to drain the
+        # rest -- already-running/finished runs drop out of the filter, so the
+        # next invocation naturally picks up where this one left off.
+        print(f"limiting to first {args.limit} of {len(runs)} runs")
+        runs = runs[: args.limit]
 
     if args.store_runs:
         Runs.store_json(runs, args.store_runs)
