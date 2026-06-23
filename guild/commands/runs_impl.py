@@ -126,7 +126,7 @@ def runs_for_args(args, ctx=None):
     return select_runs(filtered, args.runs, ctx)
 
 
-def filtered_runs(args, ctx=None):
+def filtered_runs(args, ctx=None, limit=None):
     if getattr(args, "remote", None):
         return remote_impl_support.filtered_runs(args)
     try:
@@ -138,6 +138,7 @@ def filtered_runs(args, ctx=None):
             base_filter=_runs_filter(args, ctx),
             base_sql=base_sql,
             base_params=base_params,
+            limit=limit,
         )
     except SyntaxError as e:
         _filter_syntax_error(e)
@@ -524,13 +525,18 @@ def list_runs(args, ctx=None):
 
 def _list_runs(args, ctx):
     _check_list_runs_args(args, ctx)
+    if args.json:
+        # Push --limit into the index query so only N runs' data is loaded,
+        # rather than loading every matching run and truncating afterwards.
+        # --more/--all have no JSON listing meaning, so only --limit applies.
+        if args.more or args.all:
+            cli.note("--json option always shows all runs")
+        limit = args.limit if args.limit and args.limit > 0 else None
+        _list_runs_json(filtered_runs(args, ctx=ctx, limit=limit))
+        return
     runs = filtered_runs(args, ctx=ctx)
     if args.comments:
         _list_runs_comments(_limit_runs(runs, args), args, comment_index_format=False)
-    elif args.json:
-        if args.limit or args.more or args.all:
-            cli.note("--json option always shows all runs")
-        _list_runs_json(runs)
     else:
         _list_runs_(_limit_runs(runs, args), args)
 

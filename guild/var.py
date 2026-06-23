@@ -1160,7 +1160,7 @@ def _compile_base_filters(status_include=None, status_exclude=None,
 
 
 def index_query_runs(root=None, filter_expr=None, base_sql=None,
-                     base_params=None, sort=None):
+                     base_params=None, sort=None, limit=None):
     root = root or runs_dir()
     conn = _get_index_conn(root)
 
@@ -1200,6 +1200,10 @@ def index_query_runs(root=None, filter_expr=None, base_sql=None,
                 return None
             order_parts.append(f"{col} {'DESC' if desc else 'ASC'}")
         sql += " ORDER BY " + ", ".join(order_parts)
+
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
 
     try:
         rows = conn.execute(sql, params).fetchall()

@@ -63,6 +63,7 @@ def filtered_runs(
     base_runs=None,
     base_sql=None,
     base_params=None,
+    limit=None,
 ):
     if isinstance(filter, str):
         filter = filterlib.parser().parse(filter) if filter else None
@@ -73,6 +74,7 @@ def filtered_runs(
             base_sql=base_sql,
             base_params=base_params,
             sort=sort,
+            limit=limit,
         )
         if result is not None:
             return result
@@ -84,10 +86,11 @@ def filtered_runs(
         base_runs=base_runs,
     )
     if not filter:
-        return runs
+        return runs[:limit] if limit is not None else runs
     index = index or indexlib.RunIndex()
     index.refresh(runs, _index_refresh_types(filter))
-    return [run for run in runs if _filter_run(filter, run, index)]
+    filtered = [run for run in runs if _filter_run(filter, run, index)]
+    return filtered[:limit] if limit is not None else filtered
 
 
 def _index_refresh_types(filter):
