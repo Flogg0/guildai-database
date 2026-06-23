@@ -212,8 +212,11 @@ class Worker(object):
 # filter store and read runs.
 class Runs:
     @staticmethod
-    def guild_read(runsfilter="-Se"):
-        guild_command = f"guild runs --json {runsfilter}"
+    def guild_read(runsfilter="-Se", limit=0):
+        # Push --limit into the guild query (-n) so the SQL LIMIT caps how many
+        # runs the index loads, instead of loading every match and truncating.
+        limit_arg = f" -n {limit}" if limit and limit > 0 else ""
+        guild_command = f"guild runs --json {runsfilter}{limit_arg}"
         print(f"guild_command: {guild_command}")
         output = subprocess.check_output(guild_command, shell=True)
         runs = json.loads(output)
@@ -447,10 +450,11 @@ def main():
         type=int,
         default=0,
         help=(
-            "Process at most this many runs in one invocation (the first N after "
-            "any --shuffle). Use to stay within the cluster's job/array limits "
-            "(can't submit more than ~10000 at once): run repeatedly to drain the "
-            "rest in batches. 0 = no limit."
+            "Process at most this many runs in one invocation. With --guildfilter "
+            "this is pushed into the guild query (SQL LIMIT) so only N runs are "
+            "loaded; with --runids/--runsfile the first N are taken. Use to stay "
+            "within the cluster's job/array limits (can't submit more than ~10000 "
+            "at once): run repeatedly to drain the rest in batches. 0 = no limit."
         ),
     )
 
@@ -630,7 +634,9 @@ def main():
     # ---- read runs...
     runs = None
     if args.guildfilter:
-        runs = Runs.guild_read(args.guildfilter)
+        # For a filter the limit is pushed into the guild query (SQL LIMIT), so
+        # only that many runs are ever loaded -- no Python-side truncation below.
+        runs = Runs.guild_read(args.guildfilter, limit=args.limit)
     elif args.runids:
         runs = Runs.bare_ids_to_json(args.runids)
     elif args.runsfile:
@@ -641,12 +647,12 @@ def main():
         # job-array tasks instead of clumping into a few unlucky chunks.
         random.shuffle(runs)
 
-    if args.limit and runs and len(runs) > args.limit:
-        # Cap how many runs we submit in one go (after --shuffle, so it's a
-        # random subset rather than always the same head). The cluster won't
-        # accept more than ~10000 jobs/array tasks at once; re-run to drain the
-        # rest -- already-running/finished runs drop out of the filter, so the
-        # next invocation naturally picks up where this one left off.
+    if args.limit and not args.guildfilter and runs and len(runs) > args.limit:
+        # Explicit run lists (--runids/--runsfile) have no query to push the
+        # limit into, so cap them here. The cluster won't accept more than
+        # ~10000 jobs/array tasks at once; re-run to drain the rest -- already
+        # running/finished runs drop out of the filter, so the next invocation
+        # naturally picks up where this one left off.
         print(f"limiting to first {args.limit} of {len(runs)} runs")
         runs = runs[: args.limit]
 
