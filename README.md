@@ -214,11 +214,13 @@ so they ship and version with this fork:
   `--time` sets a SLURM wall-clock limit (e.g. `24:00:00` or `1-00:00:00`,
   validated against the accepted formats) by injecting `#SBATCH --time` into the
   sbatch template; omit it to use the partition default.
-  `--limit N` processes at most N runs per invocation (the first N after any
-  `--shuffle`), so a run set larger than the cluster's ~10000 job/array-task
-  ceiling can be drained in batches: re-run the same command and already
-  running/finished runs drop out of the filter, so each invocation picks up the
-  next batch.
+  `--limit N` processes at most N runs per invocation, so a run set larger than
+  the cluster's ~10000 job/array-task ceiling can be drained in batches: re-run
+  the same command and already running/finished runs drop out of the filter, so
+  each invocation picks up the next batch. With `--guildfilter` the limit is
+  pushed into the guild query (SQL `LIMIT`) so only N runs are loaded (the most
+  recent N matching the filter); with `--runids`/`--runsfile` the first N are
+  taken.
 - **`guild-slurm-jobcount`** — prints how many of a user's SLURM jobs are
   still left to finish, parsing `squeue` text output (`guild-slurm-jobcount
   [USER]`; the user defaults to `$USER`). It is **job-array aware**: running array tasks are listed one per
