@@ -32,6 +32,7 @@ from .runs_publish import publish_runs
 from .runs_pull import pull_runs
 from .runs_purge import purge_runs
 from .runs_push import push_runs
+from .runs_restage import restage_runs
 from .runs_restore import restore_runs
 from .runs_stop import stop_runs
 from .runs_tag import tag_runs
@@ -74,6 +75,7 @@ runs.add_command(publish_runs)
 runs.add_command(pull_runs)
 runs.add_command(purge_runs)
 runs.add_command(push_runs)
+runs.add_command(restage_runs)
 runs.add_command(restore_runs)
 runs.add_command(run_info)
 runs.add_command(stop_runs)

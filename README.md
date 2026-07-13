@@ -181,6 +181,40 @@ run's run-directory writes from ~20 to ~8.
   (e.g. a worker finalizing a run) — matching the always-fresh semantics
   of per-attribute files.
 
+## Restaging runs: `guild runs restage`
+
+Resets finished runs to `staged` so they can be started again — useful for
+re-queueing a batch to `guild-slurm-runner`, which selects staged runs.
+
+    guild runs restage -Fo train -Sc          # restage completed 'train' runs
+    guild runs restage -Se -y                 # restage runs that errored
+
+Runs are selected with the standard run filters (as with `guild runs
+delete`); with no `RUN` and no filters, all runs are selected.
+
+Runs with a live process are **never restaged** — restarting a run under an
+active process would corrupt it — and a warning names how many were skipped
+for this reason. Note this can't be decided from a run's status: the index
+caches `pending` for the life of a run (`running` is never written to it, by
+design), so a running run reports `pending`. The check uses the run's `LOCK`
+file instead.
+
+Each run is restaged **in place** — it keeps its ID, run directory,
+operation, and flags, and its dependencies are re-resolved. Files written by
+a previous start are *not* removed; use `guild run --proto RUN` instead to
+start from a clean run directory. Note that staging sets a run's start time,
+so restaged runs sort to the top of `guild runs`.
+
+If a run can't be restaged (e.g. it's missing its op configuration), it is
+reported as a warning and the rest of the batch still restages; the command
+then exits non-zero.
+
+The index writes for the whole batch are deferred to **a single commit at
+the end**, rather than one commit per run as a standalone stage would do —
+the dominant cost when restaging many runs against a networked index DB.
+Runs that failed to restage are simply absent from that commit, so a partial
+failure still leaves the index consistent with what's on disk.
+
 ## Cluster staging tools (`guild.cluster`)
 
 Two console scripts for staging and running large batches on a cluster are

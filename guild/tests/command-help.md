@@ -125,6 +125,7 @@ Guild provides help text to users with the `--help` option.
       pull        Copy one or more runs from a remote location.
       purge       Permanentaly delete one or more deleted runs.
       push        Copy one or more runs to a remote location.
+      restage     Restage runs.
       restore     Restore one or more deleted runs.
       stop        Stop one or more runs.
       tag         Add or remove run tags.
@@ -161,6 +162,7 @@ with -expected +actual):`
                    'term': 'purge'},
                   {'help': 'Copy one or more runs to a remote location.',
                    'term': 'push'},
+                  {'help': 'Restage runs.', 'term': 'restage'},
                   {'help': 'Restore one or more deleted runs.', 'term': 'restore'},
                   {'help': 'Stop one or more runs.', 'term': 'stop'},
                   {'help': 'Add or remove run tags.', 'term': 'tag'}],

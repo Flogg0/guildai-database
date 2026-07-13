@@ -1542,6 +1542,94 @@ def _mark(args, ctx):
     runs_op(args, ctx, preview, confirm, no_runs, mark, LATEST_RUN_ARG, True)
 
 
+def restage(args, ctx=None):
+    preview = "You are about to restage the following runs:"
+    confirm = "Restage {count} run(s)?"
+    no_runs = "Nothing to restage."
+
+    def restage_f(selected):
+        # Batch the index writes across the whole set - each run's stage
+        # otherwise commits to the index on its own, which dominates the
+        # cost of a large restage on a networked index DB.
+        with var.index_batch_writes():
+            failed = [run for run in selected if not _restage_run(run)]
+        if failed:
+            cli.out(
+                f"Restaged {len(selected) - len(failed)} of {len(selected)} "
+                f"run(s), {len(failed)} failed",
+                err=True,
+            )
+            raise SystemExit(exit_code.DEFAULT_ERROR)
+        cli.out(f"Restaged {len(selected)} run(s)", err=True)
+
+    def select_runs_f(args, ctx, default_runs_arg):
+        selected = runs_op_selected(args, ctx, default_runs_arg)
+        running = [run for run in selected if _run_is_running(run)]
+        if not running:
+            return selected
+        cli.out(
+            cmd_impl_support.format_warn(
+                f"WARNING: {len(running)} run(s) are still running and are "
+                "not restaged - restarting a run under an active process "
+                "would corrupt it."
+            ),
+            err=True,
+        )
+        running_ids = {run.id for run in running}
+        return [run for run in selected if run.id not in running_ids]
+
+    runs_op(
+        args,
+        ctx,
+        preview,
+        confirm,
+        no_runs,
+        restage_f,
+        ALL_RUNS_ARG,
+        False,
+        select_runs_f,
+    )
+
+
+def _run_is_running(run):
+    """True if run has a live process.
+
+    `run.status` can't be used here: the index caches "pending" for the
+    life of a run (running status is never written to the index - see
+    op_util.set_run_running) so a running run reports "pending", not
+    "running". The run's lock file is the reliable signal.
+    """
+    if run.remote:
+        return True
+    pid = run.pid
+    return pid is not None and util.pid_exists(pid)
+
+
+def _restage_run(run):
+    """Restages run, returning True if staged and False otherwise.
+
+    Failures are reported as warnings rather than raised so that a
+    failed run doesn't leave the rest of the batch unrestaged.
+    """
+    from guild import main
+    from . import run_impl
+
+    try:
+        run_impl.run(restart=run.id, stage=True, quiet=True)
+    except SystemExit as e:
+        msg, code = main.system_exit_params(e)
+        if code in (exit_code.SIGTERM, exit_code.KEYBOARD_INTERRUPT):
+            raise
+        cli.out(
+            cmd_impl_support.format_warn(
+                f"WARNING: run {run.id} not restaged: {msg or f'exit code {code}'}"
+            ),
+            err=True,
+        )
+        return False
+    return True
+
+
 def select(args, ctx):
     if args.remote:
         remote_impl_support.select(args)
