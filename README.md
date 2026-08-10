@@ -261,7 +261,8 @@ Each run is restaged **in place** — it keeps its ID, run directory,
 operation, and flags, and its dependencies are re-resolved. Files written by
 a previous start are *not* removed; use `guild run --proto RUN` instead to
 start from a clean run directory. Note that staging sets a run's start time,
-so restaged runs sort to the top of `guild runs`.
+so restaged runs sort to the top of `guild runs`; because they are restaged
+in parallel, their order relative to *each other* is not defined.
 
 If a run can't be restaged (e.g. it's missing its op configuration), it is
 reported as a warning and the rest of the batch still restages; the command

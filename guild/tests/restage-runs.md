@@ -40,12 +40,18 @@ we restage the `hello` runs, leaving `hello-file` alone.
 The two `hello` runs are staged. `hello-file` is still completed.
 
 Note that staging sets a run's start time, so the restaged runs sort
-ahead of `hello-file`.
+ahead of `hello-file`. Runs are restaged in parallel by default, so the
+restaged runs' order relative to *each other* is not defined - each is
+checked on its own.
 
-    >>> run("guild runs -s")
-    [1]  hello       staged     msg=hola
-    [2]  hello       staged     msg=bonjour
-    [3]  hello-file  completed  file=hello.txt
+    >>> run("guild runs -s -F 'msg = hola'")
+    [1]  hello  staged  msg=hola
+
+    >>> run("guild runs -s -F 'msg = bonjour'")
+    [1]  hello  staged  msg=bonjour
+
+    >>> run("guild runs -s -Fo hello-file")
+    [1]  hello-file  completed  file=hello.txt
 
 Runs are restaged in place - no runs are created or deleted.
 
@@ -59,10 +65,12 @@ Runs are restaged in place - no runs are created or deleted.
 A staged run is started with `guild run --start`. Flags are preserved
 from the original run.
 
-    >>> hola = run_capture("guild select 1")
+    >>> hola = run_capture("guild select -F 'msg = hola'")
 
     >>> run(f"guild run --start {hola} -y")
     hola
+
+Starting `hola` gives it a new start time, so it now sorts first.
 
     >>> run("guild runs -s")
     [1]  hello       completed  msg=hola
