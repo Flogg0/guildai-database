@@ -1548,11 +1548,15 @@ def restage(args, ctx=None):
     no_runs = "Nothing to restage."
 
     def restage_f(selected):
-        # Batch the index writes across the whole set - each run's stage
-        # otherwise commits to the index on its own, which dominates the
-        # cost of a large restage on a networked index DB.
-        with var.index_batch_writes():
-            failed = [run for run in selected if not _restage_run(run)]
+        jobs = getattr(args, "jobs", 1) or 1
+        if jobs > 1 and len(selected) > 1:
+            failed = _restage_runs_parallel(selected, jobs)
+        else:
+            # Batch the index writes across the whole set - each run's stage
+            # otherwise commits to the index on its own, which dominates the
+            # cost of a large restage on a networked index DB.
+            with var.index_batch_writes():
+                failed = [run for run in selected if not _restage_run(run)]
         if failed:
             cli.out(
                 f"Restaged {len(selected) - len(failed)} of {len(selected)} "
@@ -1589,6 +1593,44 @@ def restage(args, ctx=None):
         False,
         select_runs_f,
     )
+
+
+def _restage_runs_parallel(runs, jobs):
+    """Restages runs across `jobs` workers, returning the runs that failed.
+
+    Reuses the parallel stager: each worker invokes guild's entrypoint
+    in-process (skipping ~150ms of interpreter startup per run) with per-run
+    index writes disabled, leaving dirty markers that one delta sync folds in
+    afterwards. Falls back to the serial path if the stager's dependencies
+    are unavailable.
+    """
+    try:
+        from guild.cluster import parallel_stager
+    except ImportError as e:
+        log.warning(
+            "Parallel restaging unavailable (%s); restaging serially", e
+        )
+        with var.index_batch_writes():
+            return [run for run in runs if not _restage_run(run)]
+
+    by_command = {f"guild run --restart {run.id} --stage --yes": run for run in runs}
+    results = parallel_stager.parallel_stage_commands(
+        list(by_command), n_jobs=jobs
+    )
+    failed = []
+    for command, error in results:
+        if error is None:
+            continue
+        run = by_command[command]
+        cli.out(
+            cmd_impl_support.format_warn(
+                f"WARNING: run {run.id} not restaged: {error}"
+            ),
+            err=True,
+        )
+        failed.append(run)
+    parallel_stager._resync_index()
+    return failed
 
 
 def _run_is_running(run):

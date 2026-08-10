@@ -30,6 +30,18 @@ def restage_params(fn):
                 help="Do not prompt before restaging runs.",
                 is_flag=True,
             ),
+            click.Option(
+                ("-j", "--jobs"),
+                metavar="N",
+                type=click.IntRange(min=1),
+                default=1,
+                help=(
+                    "Restage N runs in parallel (default 1). Each run is a "
+                    "full staging cycle, so a large restage is latency-bound "
+                    "on networked storage; workers skip per-run index writes "
+                    "and the index is resynced once at the end."
+                ),
+            ),
         ],
     )
     return fn

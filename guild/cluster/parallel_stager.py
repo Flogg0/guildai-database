@@ -8,8 +8,6 @@ import sys
 import tempfile
 
 import joblib
-import pandas as pd
-import tqdm
 from guild.cluster.helpers import yesno
 
 
@@ -27,6 +25,8 @@ def create_trial_args(args):
         command = " ".join(command)
         print(repr(command))
         subprocess.check_call(command, shell=True)
+        import pandas as pd
+
         result = pd.read_csv(ntf.name)
     trial_args = [row.dropna().to_dict() for i, row in result.iterrows()]
     return operation, trial_args
@@ -84,8 +84,46 @@ def parallel_stage_trials(trial_commands, n_jobs=None):
         n_jobs = joblib.cpu_count()
 
     jobs = [joblib.delayed(_stage_in_process)(command) for command in trial_commands]
-    result = joblib.Parallel(n_jobs=n_jobs)(tqdm.tqdm(jobs))
+    result = joblib.Parallel(n_jobs=n_jobs)(_maybe_progress(jobs))
     return result
+
+
+def _maybe_progress(jobs):
+    """Wrap jobs in a tqdm progress bar when tqdm is installed.
+
+    tqdm is not a hard requirement of Guild itself, and this module is now
+    imported by `guild runs restage`, which must work on an interpreter that
+    only has Guild's own dependencies.
+    """
+    try:
+        import tqdm
+    except ImportError:
+        return jobs
+    return tqdm.tqdm(jobs)
+
+
+def _stage_in_process_result(command):
+    """`_stage_in_process` that reports failure instead of raising.
+
+    A batch of stages should not be abandoned part-way because one run
+    failed - the serial path warns and carries on, and this keeps that
+    behaviour when the work is spread across workers.
+    """
+    try:
+        _stage_in_process(command)
+    except Exception as e:
+        return command, str(e) or type(e).__name__
+    return command, None
+
+
+def parallel_stage_commands(commands, n_jobs=None):
+    """Runs `guild` staging commands across workers, returning
+    [(command, error_or_None)] without aborting the batch on a failure.
+    """
+    if n_jobs is None:
+        n_jobs = joblib.cpu_count()
+    jobs = [joblib.delayed(_stage_in_process_result)(cmd) for cmd in commands]
+    return joblib.Parallel(n_jobs=n_jobs)(_maybe_progress(jobs))
 
 
 def _precompute_vcs_commit():
