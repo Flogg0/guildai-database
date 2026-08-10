@@ -370,6 +370,14 @@ class Run:
     def _attrs_blob_path(self):
         return os.path.join(self._guild_dir, "attrs.json")
 
+    def _attrs_blob_stamp(self):
+        """(mtime, size) of the attr blob, or None if it cannot be read."""
+        try:
+            st = os.stat(self._attrs_blob_path())
+        except OSError:
+            return None
+        return (st.st_mtime, st.st_size)
+
     def _load_attrs_blob(self):
         """Return the parsed {name: encoded} attr blob, or {} if none.
 
@@ -465,8 +473,11 @@ class Run:
         merged.update(buf)
         with open(self._attrs_blob_path(), "w") as f:
             json.dump(merged, f)
-        self._attrs_blob = None
-        self._attrs_blob_mtime = None
+        # Keep what was just written instead of forcing the next attr read to
+        # re-open and re-parse it. The stamp comes from the file, so a rewrite
+        # by another process still invalidates as usual.
+        self._attrs_blob = merged
+        self._attrs_blob_mtime = self._attrs_blob_stamp()
 
     def get_opdef_attr(self, name, default=None):
         return (self.get("opdef_attrs") or {}).get(name, default)
@@ -508,7 +519,11 @@ class Run:
                 f.write(encoded)
                 f.write(os.linesep)
                 f.close()
-        self._attrs_blob = None
+        # attrs.json is untouched by either branch here - the buffered write
+        # lands in flush_attr_buffer, and a per-attr file takes precedence
+        # over the blob in __getitem__ without changing it. Dropping the
+        # parsed blob would make the next attr read re-open and re-parse a
+        # file that has not changed.
         if name in self._INDEX_ATTRS:
             try:
                 from guild import var

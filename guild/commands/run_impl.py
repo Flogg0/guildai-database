@@ -2904,15 +2904,34 @@ def _restart_running_error(S) -> typing.NoReturn:
 ###################################################################
 
 
-def run(start=None, **kw):
-    from .run import run as run_cmd
+_run_cmd_defaults = None
 
+
+def _run_cmd_default_params():
+    """Default params for the `run` command, resolved once per process.
+
+    make_context builds a click Context and parses an empty argument list
+    purely to fill in defaults, which are the same on every call. Callers
+    that drive many runs through this API (`guild runs restage`) otherwise
+    pay a full click context construction per run - including the gettext
+    lookups click performs while parsing, which probe eight locale paths
+    that do not exist.
+    """
+    global _run_cmd_defaults
+    if _run_cmd_defaults is None:
+        from .run import run as run_cmd
+
+        _run_cmd_defaults = dict(run_cmd.make_context("", []).params)
+    return dict(_run_cmd_defaults)
+
+
+def run(start=None, **kw):
     if start is not None:
         raise ValueError("start kw not supported, use restart instead")
-    ctx = run_cmd.make_context("", [])
-    ctx.params.update(kw)
-    ctx.params["yes"] = True
-    args = click_util.Args(**ctx.params)
+    params = _run_cmd_default_params()
+    params.update(kw)
+    params["yes"] = True
+    args = click_util.Args(**params)
     main(args)
 
 
