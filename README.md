@@ -267,11 +267,27 @@ If a run can't be restaged (e.g. it's missing its op configuration), it is
 reported as a warning and the rest of the batch still restages; the command
 then exits non-zero.
 
-The index writes for the whole batch are deferred to **a single commit at
-the end**, rather than one commit per run as a standalone stage would do —
-the dominant cost when restaging many runs against a networked index DB.
-Runs that failed to restage are simply absent from that commit, so a partial
-failure still leaves the index consistent with what's on disk.
+Restaging is not a status flip: each run gets a full staging cycle, so a
+large restage is latency-bound on networked storage (~95 filesystem
+operations per run). Runs are therefore restaged **in parallel by default**,
+one job per CPU, reusing the same machinery as `guild-parallel-stager`: each
+worker invokes Guild's entrypoint in-process (skipping interpreter startup
+per run) with per-run index writes disabled, and the dirty markers they leave
+are folded in by a single delta sync at the end.
+
+    guild runs restage -Se -y                 # parallel, one job per CPU
+    guild runs restage -Se -y -j 8            # cap at 8 workers
+    guild runs restage -Se -y -j 1            # serial, in this process
+
+Use `-j 1` when you want everything in one process. That path defers the
+whole batch's index writes to **a single commit at the end**, rather than one
+commit per run as a standalone stage would do. Either way, runs that failed
+to restage are simply absent from the index update, so a partial failure
+still leaves the index consistent with what's on disk.
+
+Parallelism only pays when each stage is latency-bound. On a warm local page
+cache a stage is a few milliseconds and worker startup costs more than it
+saves — `-j 1` is faster there.
 
 ## Cluster staging tools (`guild.cluster`)
 

@@ -1548,8 +1548,10 @@ def restage(args, ctx=None):
     no_runs = "Nothing to restage."
 
     def restage_f(selected):
-        jobs = getattr(args, "jobs", 1) or 1
-        if jobs > 1 and len(selected) > 1:
+        # None means "one job per CPU" (resolved by the stager), matching
+        # guild-parallel-stager's default. -j 1 keeps the serial path.
+        jobs = getattr(args, "jobs", None)
+        if jobs != 1 and len(selected) > 1:
             failed = _restage_runs_parallel(selected, jobs)
         else:
             # Batch the index writes across the whole set - each run's stage

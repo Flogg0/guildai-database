@@ -34,12 +34,14 @@ def restage_params(fn):
                 ("-j", "--jobs"),
                 metavar="N",
                 type=click.IntRange(min=1),
-                default=1,
+                default=None,
                 help=(
-                    "Restage N runs in parallel (default 1). Each run is a "
-                    "full staging cycle, so a large restage is latency-bound "
-                    "on networked storage; workers skip per-run index writes "
-                    "and the index is resynced once at the end."
+                    "Restage N runs in parallel. Defaults to one job per CPU, "
+                    "matching guild-parallel-stager; use -j 1 to restage "
+                    "serially in this process. Each run is a full staging "
+                    "cycle, so a large restage is latency-bound on networked "
+                    "storage. Parallel workers skip per-run index writes and "
+                    "the index is resynced once at the end."
                 ),
             ),
         ],
