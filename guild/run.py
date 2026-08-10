@@ -88,6 +88,23 @@ LEGACY_RUN_ATTRS = {
 }
 
 
+# Parsed .guild/attrs.json keyed by (path, (mtime, size)). Bounded because a
+# command that touches many runs would otherwise retain every blob it read.
+_ATTRS_BLOB_CACHE_MAX = 256
+_attrs_blob_cache = {}
+
+
+def _cache_attrs_blob(key, blob):
+    if len(_attrs_blob_cache) >= _ATTRS_BLOB_CACHE_MAX:
+        _attrs_blob_cache.clear()
+    _attrs_blob_cache[key] = blob
+
+
+def _drop_cached_attrs_blob(path):
+    for key in [k for k in _attrs_blob_cache if k[0] == path]:
+        del _attrs_blob_cache[key]
+
+
 class Run:
     __properties__ = [
         "id",
@@ -402,10 +419,23 @@ class Run:
             return self._attrs_blob
         if self._attrs_blob is not None and self._attrs_blob_mtime == stamp:
             return self._attrs_blob
+        # A single command can hold several Run objects for the same run --
+        # restaging builds three, since it re-resolves the run by id through
+        # the command layer -- and each would otherwise open and parse the
+        # same unchanged file for itself. The cache key includes the stamp, so
+        # a rewritten blob is a miss by construction and the staleness window
+        # is the one described above, not a wider one.
+        key = (path, stamp)
+        cached = _attrs_blob_cache.get(key)
+        if cached is not None:
+            self._attrs_blob = cached
+            self._attrs_blob_mtime = stamp
+            return cached
         try:
             with open(path) as f:
                 self._attrs_blob = json.load(f)
             self._attrs_blob_mtime = stamp
+            _cache_attrs_blob(key, self._attrs_blob)
         except (IOError, OSError, ValueError):
             self._attrs_blob = {}
             self._attrs_blob_mtime = None
@@ -540,9 +570,12 @@ class Run:
         # otherwise the deleted attr would still read back from attrs.json.
         if self._attr_buffer is not None:
             self._attr_buffer.pop(name, None)
-        blob = self._load_attrs_blob()
+        # Copy before mutating: the parse may be shared with other Run
+        # objects for this run via _attrs_blob_cache.
+        blob = dict(self._load_attrs_blob())
         if name in blob:
             del blob[name]
+            _drop_cached_attrs_blob(self._attrs_blob_path())
             if blob:
                 with open(self._attrs_blob_path(), "w") as f:
                     json.dump(blob, f)
