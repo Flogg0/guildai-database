@@ -325,11 +325,11 @@ class Run:
             val = row.get(name)
             if val is not None:
                 return val
-            if row.get("synced_at") is not None:
-                # The row was written from disk in full, so a missing value
-                # means the run has no such attr - an answer, not a cache
-                # miss to resolve against the filesystem.
-                raise KeyError(name)
+            # A NULL column is not evidence the attr is absent: a row can be
+            # written before the attr exists (index_register_run runs before
+            # `started` is written), so a miss must still be resolved against
+            # the run dir. Only _INDEX_INIT_ATTRS below can answer "absent"
+            # from the index, because those record it affirmatively.
         elif name in self._INDEX_INIT_ATTRS and self._attr_buffer is None:
             indexed = self._ensure_index_row().get(name)
             if indexed is not None:

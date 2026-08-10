@@ -128,7 +128,15 @@ def test_clean_run_is_read_without_touching_its_directory():
         from guild import index as indexlib
 
         run_id = "a" * 32
-        run_path = _make_run(runs_dir, run_id, scalars=[("loss", 0.5, 1)])
+        # Flags are given because an attr the index stores as empty still
+        # falls through to the run dir - the index records "" for a run that
+        # had none when indexed, which is not proof it has none now.
+        run_path = _make_run(
+            runs_dir,
+            run_id,
+            scalars=[("loss", 0.5, 1)],
+            attrs={"flags": "seed: 1\n", "label": "test-label\n"},
+        )
         _index_and_register(runs_dir, [run_id])
 
         # First refresh scans the run and caches what it finds.
@@ -237,9 +245,15 @@ def test_unreadable_scan_record_rescans_rather_than_failing():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
-def test_absent_attr_answered_from_index():
-    """A run with no `stopped` must be answered from the index, not by
-    probing the run dir for a file that is not there."""
+def test_absent_init_attr_answered_from_index():
+    """An absent init-time attr is answered from the index without probing.
+
+    Only these attrs qualify. They are written once when the run is
+    initialized and never mutated, and the index records their absence
+    affirmatively (an empty string, distinct from NULL). For anything else a
+    NULL column means "not captured", not "absent" -- a row can be written
+    before an attr exists -- so a miss must still go to the run dir.
+    """
     tmpdir = _fresh_guild_home()
     runs_dir = os.path.join(tmpdir, "runs")
     try:
@@ -249,11 +263,12 @@ def test_absent_attr_answered_from_index():
 
         runs = _fresh_runs(runs_dir, [run_id])
         with _FSCounter(run_path) as counter:
-            assert runs[0].get("stopped") is None
             assert runs[0].get("sourcecode_digest") is None
+            assert runs[0].get("opdef_attrs") is None
+            assert runs[0].get("compare") is None
 
         assert not counter.hits, (
-            f"absent attrs probed the run dir: {counter.hits[:5]}"
+            f"absent init attrs probed the run dir: {counter.hits[:5]}"
         )
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
