@@ -22,6 +22,13 @@ measurable speedups on local disks.
   run lookup and the common status filters (`-Sc`, `-Se`, `-Sp`, `-Ss`).
 - Read paths (lookup, listing, filtering) are served from the index instead
   of re-scanning the run directories.
+- Reading runs for display (`guild compare`, `guild runs list`, …) does not
+  walk run directories at all. The index records where each run's event
+  files live and whether they hold logged attrs, so a run untouched since
+  its last sync is answered entirely from SQLite. Previously every refresh
+  walked each run's tree twice — once to find logged attrs, once to find
+  scalars — which dominated the cost of any query over many runs. See
+  [Read path](#read-path) below.
 - Write paths are designed to match upstream cost in the common case, and
   are faster when filtering is involved.
 - Consolidates a run's init-time attributes into a single
@@ -55,6 +62,49 @@ measurable speedups on local disks.
 - Ships the cluster staging/running tools (`guild-parallel-stager`,
   `guild-slurm-runner`) in-tree under `guild.cluster` (see below).
 
+## Read path
+
+A query that displays runs (`guild compare --csv`, `guild runs list`, the
+API and view backends) reads only the two SQLite databases in the common
+case. Over a store of ~25k runs on a local disk this took `guild compare
+--csv` from ~130 filesystem operations per run to ~0.2 for completed runs;
+on networked storage, where each of those was a round-trip, that is the
+difference between tens of minutes and seconds.
+
+What made the difference:
+
+- **One query per result set, not per run.** `index_query_runs` selects the
+  columns backing `Run._index_row` and prefills them, instead of each `Run`
+  re-querying the same columns for itself on first property access. The
+  scalar cache is loaded the same way — one query for the whole set rather
+  than one per run per column.
+- **Event dirs come from the index.** A `run_scan` table records, per run,
+  which subdirs hold event files, whether any hold logged attrs, and the
+  event filenames. The staleness digest is then recomputed by `stat`-ing
+  those known files rather than listing the directory to rediscover them.
+- **Invalidation is the dirty-marker protocol, nothing else.** Every write
+  of a run's row from disk stamps `synced_at`; the scan record stores that
+  stamp and treats a change as its only invalidation signal. A run the
+  markers have not flagged is served from the index; a flagged run is
+  re-walked and re-read. There is no third state in which a reader
+  re-derives freshness for itself.
+- **Init-time attrs are indexed.** `sourcecode_digest`, `opdef_attrs` and
+  `compare` are written once when a run is initialized and never mutated, so
+  they are columns. For these, an empty string records "this run has no such
+  attr" — a definitive answer that avoids opening anything. This is *not*
+  generalized to other attrs: a NULL column elsewhere means "not captured"
+  (a row can be written before an attr exists), and a miss still falls back
+  to the run dir.
+- **Non-terminal status is never served from the query snapshot.** Only
+  `completed`, `error` and `terminated` are; anything in flight is resolved
+  from the run's own marker files, because a snapshot taken when the query
+  ran can otherwise report a run as `pending` after it has failed.
+
+Trade-off: a new event *subdirectory* appearing in a run whose row has not
+been re-synced is not noticed. Changes to existing event files are, via the
+digest. Anything that goes through the normal lifecycle — a run finishing, a
+restart — re-syncs the row and re-scans the run.
+
 ## Worker-mode: `GUILD_NO_INDEX_WRITES`
 
 On heavily-parallel clusters (many concurrent `guild run` processes sharing
@@ -87,10 +137,18 @@ Behavioral details:
   their own reads — only "headnode" (unset env var) invocations do the
   resync. This avoids thundering-herd syncs when many workers start at
   once.
-- Per-run marker freshness is tracked by `mtime`, compared against the DB
-  file's mtime. Clearing is compare-and-delete: if a worker re-touches a
-  marker while a resync is in progress, the marker survives the clear and
-  the next operation syncs again.
+- Per-run marker freshness is tracked by `mtime`, compared against the
+  `dirty_synced_mtime` recorded for *that run* — the mtime of the marker it
+  was last re-read for. Comparing against the index DB file's mtime (as this
+  once did) aliases every run together: a write about one run retires a
+  pending marker for another, after which the marker is never fresh, never
+  processed and never cleared, and its run's row stays stale until a full
+  resync. The recorded value is a marker mtime rather than a local clock
+  reading so that both sides come from the filesystem holding the markers,
+  and a clock offset between a worker and the headnode cannot silently
+  retire a pending marker. Clearing is compare-and-delete: if a worker
+  re-touches a marker while a resync is in progress, the marker survives the
+  clear and the next operation syncs again.
 - A full sync also clears per-run markers whose `mtime` is older than the
   sync started, so a full resync followed by a delta read doesn't
   redundantly re-upsert runs the full sync already covered.
