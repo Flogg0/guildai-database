@@ -1305,6 +1305,11 @@ def _compile_base_filters(status_include=None, status_exclude=None,
     return " AND ".join(clauses) if clauses else "", params
 
 
+# A run in one of these states stays there unless it is restarted, which
+# goes through the dirty-marker protocol. Anything else is in flight.
+_TERMINAL_STATUSES = frozenset(("completed", "error", "terminated"))
+
+
 def index_query_runs(root=None, filter_expr=None, base_sql=None,
                      base_params=None, sort=None, limit=None):
     root = root or runs_dir()
@@ -1387,7 +1392,15 @@ def index_query_runs(root=None, filter_expr=None, base_sql=None,
             run = runlib.Run(rid, os.path.join(root, rid))
             if prefill:
                 try:
-                    run._index_row = index_row_from_cols(row[1:])
+                    prefilled = index_row_from_cols(row[1:])
+                    if prefilled.get("status") not in _TERMINAL_STATUSES:
+                        # A non-terminal status can change at any moment, and
+                        # Run.status resolves those from the run's own marker
+                        # files. Serving one from a snapshot taken when the
+                        # query ran reports a run as pending after it has
+                        # already failed.
+                        prefilled.pop("status", None)
+                    run._index_row = prefilled
                 except (ValueError, TypeError):
                     pass
             result.append(run)
