@@ -150,6 +150,15 @@ class Run:
         return self.id[:8]
 
     @property
+    def indexed_op_name(self):
+        """The formatted operation name recorded in the run index, if any.
+
+        None when the run has no index row (the caller then formats it from
+        the run itself).
+        """
+        return self._ensure_index_row().get("op_name")
+
+    @property
     def dir(self):
         """Alias for path attr."""
         return self.path

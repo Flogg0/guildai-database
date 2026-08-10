@@ -98,7 +98,7 @@ def _is_float_tensor(t):
     return t.dtype in (1, 2)
 
 
-def scalar_readers(root_path):
+def scalar_readers(root_path, dirs=None):
     """Returns an iterator that yields (dir, digest, reader) tuples.
 
     For each yielded events dir, `digest` changes whenever events have
@@ -106,11 +106,26 @@ def scalar_readers(root_path):
 
     `reader` is an instance of ScalarReader that can be used to read
     scalars in dir.
+
+    `dirs` is an optional list of known event dirs. When provided, those
+    dirs are used as-is and `root_path` is not searched -- callers that
+    already know where a run's events live (e.g. from the run index) can
+    skip the directory walk entirely.
     """
     _ensure_tb_logging_patched()
-    for subdir_path in _tfevent_subdirs(root_path):
+    for subdir_path in (_tfevent_subdirs(root_path) if dirs is None else dirs):
         digest = _event_files_digest(subdir_path)
         yield subdir_path, digest, ScalarReader(subdir_path)
+
+
+def event_dirs(root_path):
+    """Returns the list of dirs under root_path containing event files.
+
+    This is the directory walk that `scalar_readers` and `attr_readers`
+    perform implicitly. Callers that cache the result across invocations
+    use it directly and then pass `dirs` to the readers.
+    """
+    return list(_tfevent_subdirs(root_path))
 
 
 def _tfevent_subdirs(dir):
@@ -209,12 +224,15 @@ def _is_text_tensor(t):
     return t.dtype == 7
 
 
-def attr_readers(root_path):
+def attr_readers(root_path, dirs=None):
     """Returns an iterator that yields (dir, reader) tuples.
 
     `reader` is an instance of AttrReader that can be used to read
     logged attributes in dir.
+
+    `dirs` has the same meaning as in `scalar_readers` - known event dirs
+    to use instead of walking `root_path`.
     """
     _ensure_tb_logging_patched()
-    for subdir_path in _tfevent_subdirs(root_path):
+    for subdir_path in (_tfevent_subdirs(root_path) if dirs is None else dirs):
         yield subdir_path, AttrReader(subdir_path)

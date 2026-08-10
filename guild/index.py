@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import json
 import logging
 import os
 import sqlite3
@@ -42,12 +43,23 @@ CORE_ATTRS = {
 }
 
 
+# SQLite's default parameter limit is 999; stay under it when expanding a
+# run list into an IN clause.
+_ID_CHUNK = 500
+
+
+def _id_chunks(runs):
+    ids = [run.id for run in runs]
+    for i in range(0, len(ids), _ID_CHUNK):
+        yield ids[i:i + _ID_CHUNK]
+
+
 class AttrReader:
     def __init__(self):
         self._data = {}
 
-    def refresh(self, runs):
-        self._data = _runs_attr_data(runs)
+    def refresh(self, runs, event_dirs=None):
+        self._data = _runs_attr_data(runs, event_dirs or {})
 
     def read(self, run, attr):
         run_data = self._data.get(run.id)
@@ -64,15 +76,15 @@ class AttrReader:
         return self._data.get(run.id)
 
 
-def _runs_attr_data(runs):
-    return {run.id: _run_attr_data(run) for run in runs}
+def _runs_attr_data(runs, event_dirs):
+    return {run.id: _run_attr_data(run, event_dirs.get(run.id)) for run in runs}
 
 
-def _run_attr_data(run):
+def _run_attr_data(run, event_dirs=None):
     # Order is important - core overrides user-defined attrs
     return {
         **_run_opdef_attrs(run),
-        **_run_logged_attrs(run),
+        **_run_logged_attrs(run, event_dirs),
         **_run_core_attrs(run),
     }
 
@@ -81,9 +93,13 @@ def _run_opdef_attrs(run):
     return run.get("opdef_attrs") or {}
 
 
-def _run_logged_attrs(run):
+def _run_logged_attrs(run, event_dirs=None):
     attrs = {}
-    for path, reader in tfevent.attr_readers(run.dir):
+    if event_dirs is not None and not event_dirs:
+        # The index knows this run has no event dirs - nothing to read, and
+        # no reason to look.
+        return attrs
+    for path, reader in tfevent.attr_readers(run.dir, dirs=event_dirs):
         prefix = _attr_prefix(path, run.dir)
         for name, val in reader:
             attrs[_attr_name(prefix, name)] = val
@@ -106,10 +122,15 @@ def _run_core_attrs(run):
     started = run.get("started")
     stopped = run.get("stopped")
     status = run.status
+    # The run index already stores the formatted operation (it computes the
+    # same run_util.format_operation when indexing the run). Reusing it avoids
+    # re-deriving the value here, which stats .guild/proto to resolve a batch
+    # run's proto description.
+    operation = run.indexed_op_name or run_util.format_operation(run)
     data = {
         "id": run.id,
         "run": run.short_id,
-        "operation": run_util.format_operation(run),
+        "operation": operation,
         "from": run_util.format_pkg_name(run),
         "op": opref.op_name,
         "op_model": opref.model_name,
@@ -156,15 +177,61 @@ class ScalarReader:
 
     def __init__(self, db):
         self._db = db
+        self._source_digests = None
+        self._preloaded = None
 
-    def refresh(self, runs):
+    def refresh(self, runs, event_dirs=None):
+        event_dirs = event_dirs or {}
+        self._preload_source_digests(runs)
         dirty = False
         for run in runs:
-            for path, cur_digest, reader in tfevent.scalar_readers(run.dir):
+            dirs = event_dirs.get(run.id)
+            if dirs is not None and not dirs:
+                continue
+            for path, cur_digest, reader in tfevent.scalar_readers(run.dir, dirs=dirs):
                 if self._maybe_refresh_run_scalars(run, path, cur_digest, reader):
                     dirty = True
         if dirty:
             self._db.commit()
+            self._source_digests = None
+        self._preload_scalars(runs)
+
+    def _preload_source_digests(self, runs):
+        """Load every refreshed run's source digests in one query.
+
+        Replaces a per-run SELECT in _scalar_source_digest. Each of those
+        statements also cost SQLite a hot-journal probe (a stat of the
+        -journal and -wal paths), so on networked storage the per-run query
+        was several round-trips, not one.
+        """
+        self._source_digests = {}
+        for chunk in _id_chunks(runs):
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = self._db.execute(
+                f"SELECT run, prefix, path_digest FROM scalar_source "
+                f"WHERE run IN ({placeholders})",
+                chunk,
+            )
+            for run_id, prefix, digest in rows:
+                self._source_digests[(run_id, prefix)] = digest
+
+    def _preload_scalars(self, runs):
+        """Load every refreshed run's scalars in one query.
+
+        `read` and `iter_scalars` are called per run per column, so serving
+        them from memory removes the bulk of this DB's query traffic.
+        """
+        self._preloaded = {run.id: [] for run in runs}
+        for chunk in _id_chunks(runs):
+            placeholders = ", ".join("?" for _ in chunk)
+            cur = self._db.execute(
+                f"SELECT * FROM scalar WHERE run IN ({placeholders})",
+                chunk,
+            )
+            cols = [col[0] for col in cur.description]
+            for row in cur.fetchall():
+                s = dict(zip(cols, row))
+                self._preloaded.setdefault(s["run"], []).append(s)
 
     def _maybe_refresh_run_scalars(self, run, path, cur_digest, reader):
         log.debug("Found events in %s (digest %s)", path, cur_digest)
@@ -188,6 +255,8 @@ class ScalarReader:
         self._write_source_digest(run.id, prefix, cur_digest)
 
     def _scalar_source_digest(self, run_id, prefix):
+        if self._source_digests is not None:
+            return self._source_digests.get((run_id, prefix))
         cur = self._db.execute(
             """
           SELECT path_digest FROM scalar_source
@@ -256,6 +325,9 @@ class ScalarReader:
 
     def read(self, run, prefix, tag, qual, step):
         col_index = self._read_col_index(qual, step)
+        preloaded = self._preloaded.get(run.id) if self._preloaded is not None else None
+        if preloaded is not None:
+            return self._read_preloaded(preloaded, prefix, tag, qual, step)
         cur = self._db.cursor()
         if prefix is None:
             cur.execute(
@@ -279,6 +351,32 @@ class ScalarReader:
             return None
         return row[col_index]
 
+    _COL_NAMES = [
+        "run", "prefix", "tag", "first_val", "first_step", "last_val",
+        "last_step", "min_val", "min_step", "max_val", "max_step", "avg_val",
+        "total", "count",
+    ]
+
+    def _read_preloaded(self, rows, prefix, tag, qual, step):
+        """In-memory equivalent of the `read` SELECTs.
+
+        Match order mirrors the SQL: unprefixed reads take the first row in
+        table order, prefixed reads take the first ordered by (prefix, tag).
+        """
+        col = self._COL_NAMES[self._read_col_index(qual, step)]
+        if prefix is None:
+            for s in rows:
+                if s["tag"] == tag:
+                    return s[col]
+            return None
+        matched = [
+            s for s in rows if s["tag"] == tag and str(s["prefix"]).startswith(prefix)
+        ]
+        if not matched:
+            return None
+        matched.sort(key=lambda s: (s["prefix"], s["tag"]))
+        return matched[0][col]
+
     def _read_col_index(self, qual, step):
         try:
             return self._col_index_map[(qual or "last", step)]
@@ -288,6 +386,11 @@ class ScalarReader:
             ) from None
 
     def iter_scalars(self, run):
+        preloaded = self._preloaded.get(run.id) if self._preloaded is not None else None
+        if preloaded is not None:
+            for s in sorted(preloaded, key=lambda s: (s["prefix"], s["tag"])):
+                yield s
+            return
         cur = self._db.execute(
             """
           SELECT * FROM scalar
@@ -298,6 +401,24 @@ class ScalarReader:
         )
         for row in cur.fetchall():
             yield {col[0]: row[i] for i, col in enumerate(cur.description)}
+
+
+def _decode_scan_prefixes(encoded):
+    """Decodes a run_scan prefixes payload, or None if unrecognized.
+
+    This is a derived cache and the payload shape has changed between Guild
+    versions, so a record this version cannot read means "rescan this run",
+    never an error.
+    """
+    try:
+        decoded = json.loads(encoded)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(decoded, list):
+        return None
+    if not all(isinstance(prefix, str) for prefix in decoded):
+        return None
+    return decoded
 
 
 def _scalar_prefix(scalars_path, root):
@@ -392,12 +513,82 @@ class RunIndex:
 
         `types` is an optional list of data types to refresh.
         """
+        needs_events = types is None or "attr" in types or "scalar" in types
+        event_dirs = self._run_event_dirs(runs) if needs_events else {}
         if types is None or "attr" in types:
-            self._attr_reader.refresh(runs)
+            self._attr_reader.refresh(runs, event_dirs)
         if types is None or "flag" in types:
             self._flag_reader.refresh(runs)
         if types is None or "scalar" in types:
-            self._scalar_reader.refresh(runs)
+            self._scalar_reader.refresh(runs, event_dirs)
+
+    def _run_event_dirs(self, runs):
+        """Maps run id -> list of dirs holding that run's event files.
+
+        Finding those dirs means walking the run directory, which is by far
+        the most expensive thing an index refresh does - and its result is
+        stable for a run that isn't being written to. So the result is cached
+        in the index and keyed on the run's status: any status change (staged
+        -> running -> completed) re-walks, and a run whose status is unchanged
+        is served from the index without touching the filesystem.
+
+        A run with no event dirs is recorded as such, so "no events" is
+        distinguishable from "not yet scanned" and does not re-walk forever.
+        """
+        recorded = self._recorded_event_dirs(runs)
+        dirs = {}
+        new_records = []
+        for run in runs:
+            status = run.status
+            cached = recorded.get(run.id)
+            if cached is not None and cached[0] == status:
+                dirs[run.id] = [
+                    os.path.join(run.dir, p) if p else run.dir for p in cached[1]
+                ]
+                continue
+            found = tfevent.event_dirs(run.dir)
+            dirs[run.id] = found
+            new_records.append(
+                (
+                    run.id,
+                    status,
+                    json.dumps([_scalar_prefix(p, run.dir) for p in found]),
+                )
+            )
+        if new_records:
+            self._write_run_scans(new_records)
+        return dirs
+
+    def _recorded_event_dirs(self, runs):
+        recorded = {}
+        for chunk in _id_chunks(runs):
+            placeholders = ", ".join("?" for _ in chunk)
+            try:
+                rows = self._db.execute(
+                    f"SELECT run, status, prefixes FROM run_scan "
+                    f"WHERE run IN ({placeholders})",
+                    chunk,
+                )
+            except sqlite3.OperationalError:
+                return {}
+            for run_id, status, prefixes in rows:
+                decoded = _decode_scan_prefixes(prefixes)
+                if decoded is not None:
+                    recorded[run_id] = (status, decoded)
+        return recorded
+
+    def _write_run_scans(self, records):
+        try:
+            self._db.executemany(
+                "INSERT OR REPLACE INTO run_scan (run, status, prefixes) "
+                "VALUES (?, ?, ?)",
+                records,
+            )
+            self._db.commit()
+        except sqlite3.OperationalError as e:
+            # A read-only or locked index must not break the read path - the
+            # walk above already produced the right answer.
+            log.debug("Unable to record run scans: %s", e)
 
     def run_attr(self, run, name):
         return self._attr_reader.read(run, name)
@@ -455,6 +646,15 @@ def _init_run_index_tables(db):
         """
       CREATE UNIQUE INDEX IF NOT EXISTS scalar_source_pk
       ON scalar_source (run, prefix)
+    """
+    )
+    db.execute(
+        """
+      CREATE TABLE IF NOT EXISTS run_scan (
+        run TEXT PRIMARY KEY,
+        status TEXT,
+        prefixes TEXT
+      )
     """
     )
 

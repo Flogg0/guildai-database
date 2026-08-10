@@ -1671,8 +1671,19 @@ def for_file(src, extends_seen=None, no_cache=False):
     return guildfile
 
 
+_realpath_cache = {}
+
+
 def _cache_key(src):
-    return os.path.realpath(src)
+    # realpath() lstats every component of the path. The guildfile path is
+    # the same for every run of a given operation, so resolving it once per
+    # path (rather than once per for_file call) removes a per-run walk up the
+    # project directory for callers that resolve a guildfile per run.
+    try:
+        return _realpath_cache[src]
+    except KeyError:
+        key = _realpath_cache[src] = os.path.realpath(src)
+        return key
 
 
 def _load_guildfile(src, extends_seen):

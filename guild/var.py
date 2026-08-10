@@ -851,6 +851,7 @@ def rebuild_index(root=None):
 INDEX_ROW_COLS = (
     "status",
     "opref",
+    "op_name",
     "started",
     "stopped",
     "initialized",
