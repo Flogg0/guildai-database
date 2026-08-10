@@ -266,6 +266,7 @@ def _init_index_schema(conn):
         "  opref TEXT,"
         "  op_name TEXT,"
         "  started INTEGER,"
+        "  stopped INTEGER,"
         "  initialized INTEGER,"
         "  label TEXT,"
         "  flags TEXT,"
@@ -273,9 +274,19 @@ def _init_index_schema(conn):
         ")"
     )
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
-    for col in ("label", "flags", "tags", "op_name"):
+    # Type matters on the migration path: a TEXT-affinity column stores
+    # stopped's integer timestamp as a string, and run_util.calc_run_duration
+    # does arithmetic on it. Fresh DBs get INTEGER from the CREATE above; added
+    # columns must match.
+    for col, col_type in (
+        ("label", "TEXT"),
+        ("flags", "TEXT"),
+        ("tags", "TEXT"),
+        ("op_name", "TEXT"),
+        ("stopped", "INTEGER"),
+    ):
         if col not in existing_cols:
-            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} TEXT")
+            conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {col_type}")
     conn.commit()
 
 
@@ -383,7 +394,14 @@ def _get_index_conn(root=None):
             fast_conn = None
             try:
                 fast_conn = _connect_db(db_path)
-                fast_conn.execute("SELECT 1 FROM runs LIMIT 1")
+                # Probe the columns queries actually select, not just the
+                # table: a DB written by an older Guild is missing newer
+                # columns, and a bare "SELECT 1" would pass it through here
+                # without ever running _init_index_schema's migration. The
+                # query would then fail and silently degrade to a full
+                # filesystem scan. Failing here routes to the lock path, which
+                # migrates.
+                fast_conn.execute(f"SELECT {INDEX_ROW_SQL} FROM runs LIMIT 1")
                 setattr(_index_local, cache_key, fast_conn)
                 return fast_conn
             except sqlite3.OperationalError:
@@ -827,6 +845,31 @@ def rebuild_index(root=None):
     index_sync(root)
 
 
+# Columns that back Run._index_row. Selected by index_query_runs (once for
+# the whole result set) and by Run._ensure_index_row (per run, on a cache
+# miss); index_row_from_cols decodes either into the same dict.
+INDEX_ROW_COLS = (
+    "status",
+    "opref",
+    "started",
+    "stopped",
+    "initialized",
+    "label",
+    "flags",
+    "tags",
+)
+
+INDEX_ROW_SQL = ", ".join(INDEX_ROW_COLS)
+
+
+def index_row_from_cols(row):
+    """Decode a row selected as INDEX_ROW_SQL into a Run._index_row dict."""
+    data = dict(zip(INDEX_ROW_COLS, row))
+    data["flags"] = json.loads(data["flags"]) if data["flags"] else None
+    data["tags"] = json.loads(data["tags"]) if data["tags"] else None
+    return data
+
+
 def _index_run_row(run):
     """Read a run from disk and build its index row tuple.
 
@@ -847,6 +890,7 @@ def _index_run_row(run):
         pass
     status = run.status
     started = run.get("started")
+    stopped = run.get("stopped")
     initialized = run.get("initialized")
     label = run.get("label", "")
     flags = ""
@@ -863,14 +907,18 @@ def _index_run_row(run):
             tags = json.dumps(t)
     except Exception:
         pass
-    return (run.id, status, opref_str, op_name, started, initialized, label, flags, tags)
+    return (
+        run.id, status, opref_str, op_name, started, stopped, initialized, label,
+        flags, tags
+    )
 
 
 def _index_upsert_row(conn, row):
     conn.execute(
         "INSERT OR REPLACE INTO runs "
-        "(run_id, status, opref, op_name, started, initialized, label, flags, tags) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "(run_id, status, opref, op_name, started, stopped, initialized, label, "
+        "flags, tags) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         row,
     )
 
@@ -900,6 +948,7 @@ def index_update_attr(run, name, val, root=None):
     col_map = {
         "label": "label",
         "started": "started",
+        "stopped": "stopped",
         "initialized": "initialized",
     }
     pending = getattr(_index_local, 'pending_writes', None)
@@ -1178,7 +1227,7 @@ def index_query_runs(root=None, filter_expr=None, base_sql=None,
         where_parts.append(expr_sql)
         params.extend(expr_params)
 
-    sql = "SELECT run_id FROM runs"
+    sql = f"SELECT run_id, {INDEX_ROW_SQL} FROM runs"
     if where_parts:
         sql += " WHERE " + " AND ".join(where_parts)
 
@@ -1227,11 +1276,24 @@ def index_query_runs(root=None, filter_expr=None, base_sql=None,
         on_disk = set(os.listdir(root))
     except OSError:
         on_disk = None
+    # Prefill each Run's index row from the row we already selected. Without
+    # this every Run re-queries the same columns for itself on first property
+    # access (Run._ensure_index_row), turning one query into N+1 -- a per-run
+    # round-trip to the DB for data already in hand. Skipped during a dirty
+    # sync, where Run properties must recompute from the filesystem.
+    prefill = not getattr(_index_local, 'in_dirty_sync', False)
     result = []
     stale = []
-    for (rid,) in rows:
+    for row in rows:
+        rid = row[0]
         if on_disk is None or rid in on_disk:
-            result.append(runlib.Run(rid, os.path.join(root, rid)))
+            run = runlib.Run(rid, os.path.join(root, rid))
+            if prefill:
+                try:
+                    run._index_row = index_row_from_cols(row[1:])
+                except (ValueError, TypeError):
+                    pass
+            result.append(run)
         else:
             stale.append((rid,))
     if stale:

@@ -132,21 +132,11 @@ class Run:
             import sqlite3
             conn = var._get_index_conn()
             row = conn.execute(
-                "SELECT status, opref, started, initialized, label, flags, tags"
-                " FROM runs WHERE run_id = ?",
+                f"SELECT {var.INDEX_ROW_SQL} FROM runs WHERE run_id = ?",
                 (self.id,),
             ).fetchone()
             if row:
-                import json
-                self._index_row = {
-                    "status": row[0],
-                    "opref": row[1],
-                    "started": row[2],
-                    "initialized": row[3],
-                    "label": row[4],
-                    "flags": json.loads(row[5]) if row[5] else None,
-                    "tags": json.loads(row[6]) if row[6] else None,
-                }
+                self._index_row = var.index_row_from_cols(row)
                 return self._index_row
         except sqlite3.DatabaseError:
             var._nuke_index()
@@ -297,7 +287,9 @@ class Run:
             except KeyError:
                 pass
 
-    _INDEX_READABLE = frozenset(("flags", "tags", "label", "started", "initialized"))
+    _INDEX_READABLE = frozenset(
+        ("flags", "tags", "label", "started", "stopped", "initialized")
+    )
 
     def __getitem__(self, name):
         if name in self._INDEX_READABLE:
@@ -433,7 +425,9 @@ class Run:
             return self._guild_dir
         return os.path.join(*((self._guild_dir,) + tuple(subpath)))
 
-    _INDEX_ATTRS = frozenset(("flags", "tags", "label", "started", "initialized"))
+    _INDEX_ATTRS = frozenset(
+        ("flags", "tags", "label", "started", "stopped", "initialized")
+    )
 
     def write_attr(self, name, val, raw=False):
         if not raw:
