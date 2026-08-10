@@ -325,6 +325,68 @@ def test_digest_changes_when_an_event_file_grows():
         shutil.rmtree(tmpdir, ignore_errors=True)
 
 
+def test_retained_marker_survives_unrelated_index_writes():
+    """A marker stays pending until its own run has been re-read for it.
+
+    _do_delta_sync deliberately keeps the marker for a run with no definitive
+    status, so the sync retries once the run finishes. That retry only
+    happens if freshness is judged per run: when it was judged against the
+    index DB file's mtime, a write about any other run retired the marker,
+    after which it was never processed again and the run's row stayed stale
+    permanently.
+    """
+    tmpdir = _fresh_guild_home()
+    runs_dir = os.path.join(tmpdir, "runs")
+    try:
+        from guild import run as runlib
+        from guild import var as gvar
+
+        inflight, other = "1" * 32, "2" * 32
+        # In flight: no exit_status, so a delta sync must skip and retry it.
+        _make_run(runs_dir, inflight, status="running")
+        _make_run(runs_dir, other, status="completed")
+        _index_and_register(runs_dir, [inflight, other])
+
+        attrs = os.path.join(runs_dir, inflight, ".guild", "attrs")
+        with open(os.path.join(attrs, "label"), "w") as f:
+            f.write("written-by-worker\n")
+        time.sleep(1.1)  # marker mtime resolution
+        gvar._touch_run_dirty_marker(runs_dir, inflight)
+        gvar._drop_cached_conn(f"conn_{gvar._index_db_path(runs_dir)}")
+
+        # A read syncs, skips the in-flight run, and keeps its marker.
+        gvar._get_index_conn(runs_dir)
+        assert os.path.exists(
+            os.path.join(gvar._dirty_runs_dir(runs_dir), inflight)
+        ), "marker for an in-flight run should be retained"
+
+        # Index activity about an unrelated run.
+        time.sleep(1.1)
+        gvar.index_update_status(
+            runlib.Run(other, os.path.join(runs_dir, other)),
+            "completed",
+            root=runs_dir,
+        )
+
+        # The run finishes for real.
+        with open(os.path.join(attrs, "label"), "w") as f:
+            f.write("final-label\n")
+        with open(os.path.join(attrs, "exit_status"), "w") as f:
+            f.write("0")
+        gvar._drop_cached_conn(f"conn_{gvar._index_db_path(runs_dir)}")
+
+        conn = gvar._get_index_conn(runs_dir)
+        label = conn.execute(
+            "SELECT label FROM runs WHERE run_id = ?", (inflight,)
+        ).fetchone()[0]
+        assert label == "final-label", (
+            f"retained marker was not honored after unrelated index writes; "
+            f"index still reports {label!r}"
+        )
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def test_run_without_index_row_still_reads_from_disk():
     """The index is an accelerator, not a prerequisite: a run it has never
     seen must still be read correctly."""

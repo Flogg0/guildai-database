@@ -199,6 +199,65 @@ def _list_dirty_run_markers(root=None):
     return out
 
 
+def _unsynced_markers(db_path, markers):
+    """Returns the markers whose run has not been synced for them yet.
+
+    Freshness is per run: a marker counts until the run it names has been
+    re-read for that marker, recorded as dirty_synced_mtime. Comparing
+    against the index DB file's mtime instead - as this once did - aliases
+    every run together, so a write about one run ages out a pending marker
+    for another. A marker aged out that way is never fresh again, so it is
+    never processed and never cleared, and its run's row stays stale for
+    good. That is also why the recorded value is a marker mtime rather than
+    a local clock reading: both sides come from the filesystem holding the
+    markers, so a clock offset between a worker and the headnode cannot
+    silently retire a pending marker.
+    """
+    synced = {}
+    conn = None
+    try:
+        conn = _connect_db(db_path)
+        run_ids = [run_id for run_id, _mtime in markers]
+        for i in range(0, len(run_ids), 500):
+            chunk = run_ids[i:i + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            rows = conn.execute(
+                f"SELECT run_id, dirty_synced_mtime FROM runs "
+                f"WHERE run_id IN ({placeholders})",
+                chunk,
+            )
+            for run_id, mtime in rows:
+                if mtime is not None:
+                    synced[run_id] = mtime
+    except sqlite3.Error:
+        # No DB, or a schema without the column: treat every marker as
+        # pending. Re-syncing a run that did not need it is wasted work;
+        # skipping one that did is a stale row.
+        return list(markers)
+    finally:
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    return [(r, m) for (r, m) in markers if m > synced.get(r, 0)]
+
+
+def _record_marker_synced(conn, run_id, mtime):
+    """Records that run_id has been re-read for a marker of the given mtime.
+
+    Kept out of _index_upsert_row, whose INSERT OR REPLACE would blank the
+    column for every other write path.
+    """
+    try:
+        conn.execute(
+            "UPDATE runs SET dirty_synced_mtime = ? WHERE run_id = ?",
+            (mtime, run_id),
+        )
+    except sqlite3.OperationalError:
+        pass
+
+
 def _clear_run_dirty_marker_if_unchanged(root, run_id, seen_mtime):
     path = os.path.join(_dirty_runs_dir(root), run_id)
     try:
@@ -274,7 +333,8 @@ def _init_index_schema(conn):
         "  sourcecode_digest TEXT,"
         "  opdef_attrs TEXT,"
         "  compare TEXT,"
-        "  synced_at INTEGER"
+        "  synced_at INTEGER,"
+        "  dirty_synced_mtime REAL"
         ")"
     )
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
@@ -292,6 +352,7 @@ def _init_index_schema(conn):
         ("opdef_attrs", "TEXT"),
         ("compare", "TEXT"),
         ("synced_at", "INTEGER"),
+        ("dirty_synced_mtime", "REAL"),
     ):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {col_type}")
@@ -375,11 +436,7 @@ def _get_index_conn(root=None):
         if dirty_mtime is None:
             markers = _list_dirty_run_markers(root)
             if markers:
-                try:
-                    db_mtime = os.path.getmtime(db_path)
-                except OSError:
-                    db_mtime = 0
-                fresh = [(r, m) for (r, m) in markers if m > db_mtime]
+                fresh = _unsynced_markers(db_path, markers)
                 if fresh:
                     per_run_markers = fresh
                     _drop_cached_conn(cache_key)
@@ -805,11 +862,15 @@ def _do_delta_sync(conn, root, markers):
 
     for kind, run_id, mtime, row in _parallel_read(_read, markers):
         if kind == "skip":
+            # Left for a later sync: the run has no definitive status yet.
+            # Its marker stays pending, so the retry the marker exists for
+            # actually happens.
             continue
         if kind == "delete":
             conn.execute("DELETE FROM runs WHERE run_id = ?", (run_id,))
         else:
             _index_upsert_row(conn, row)
+            _record_marker_synced(conn, run_id, mtime)
         _clear_run_dirty_marker_if_unchanged(root, run_id, mtime)
     conn.commit()
 
