@@ -82,11 +82,12 @@ def _runs_attr_data(runs, event_dirs):
 
 def _run_attr_data(run, event_dirs=None):
     # Order is important - core overrides user-defined attrs
-    return {
-        **_run_opdef_attrs(run),
-        **_run_logged_attrs(run, event_dirs),
-        **_run_core_attrs(run),
-    }
+    with run.pinned_attrs():
+        return {
+            **_run_opdef_attrs(run),
+            **_run_logged_attrs(run, event_dirs),
+            **_run_core_attrs(run),
+        }
 
 
 def _run_opdef_attrs(run):
@@ -407,8 +408,9 @@ def _decode_scan_prefixes(encoded):
     """Decodes a run_scan prefixes payload, or None if unrecognized.
 
     This is a derived cache and the payload shape has changed between Guild
-    versions, so a record this version cannot read means "rescan this run",
-    never an error.
+    versions -- it previously held bare prefixes, and now (prefix, has_attrs)
+    pairs. A record this version cannot read means "rescan this run", never an
+    error.
     """
     try:
         decoded = json.loads(encoded)
@@ -416,8 +418,11 @@ def _decode_scan_prefixes(encoded):
         return None
     if not isinstance(decoded, list):
         return None
-    if not all(isinstance(prefix, str) for prefix in decoded):
-        return None
+    for item in decoded:
+        if not isinstance(item, list) or len(item) != 2:
+            return None
+        if not isinstance(item[0], str):
+            return None
     return decoded
 
 
@@ -514,13 +519,42 @@ class RunIndex:
         `types` is an optional list of data types to refresh.
         """
         needs_events = types is None or "attr" in types or "scalar" in types
-        event_dirs = self._run_event_dirs(runs) if needs_events else {}
+        scanned = self._run_event_dirs(runs) if needs_events else {}
         if types is None or "attr" in types:
-            self._attr_reader.refresh(runs, event_dirs)
+            # Only dirs that actually hold logged attrs are worth reading.
+            attr_dirs = {
+                run_id: [path for path, has_attrs in dirs if has_attrs]
+                for run_id, dirs in scanned.items()
+            }
+            self._attr_reader.refresh(runs, attr_dirs)
         if types is None or "flag" in types:
             self._flag_reader.refresh(runs)
         if types is None or "scalar" in types:
-            self._scalar_reader.refresh(runs, event_dirs)
+            scalar_dirs = {
+                run_id: [path for path, _has_attrs in dirs]
+                for run_id, dirs in scanned.items()
+            }
+            self._scalar_reader.refresh(runs, scalar_dirs)
+
+    def batch_runs(self, runs):
+        """Returns the ids of `runs` that are batch runs.
+
+        Batch-ness is fixed once a run is created, so it is recorded with the
+        run scan and served from there; without that, callers that filter
+        batches out stat .guild/proto for every run on every invocation.
+        """
+        from guild import batch_util
+
+        recorded = self._recorded_scans(runs)
+        batch = set()
+        for run in runs:
+            scan = recorded.get(run.id)
+            if scan is not None and scan[0] == run.status:
+                if scan[2]:
+                    batch.add(run.id)
+            elif batch_util.is_batch(run):
+                batch.add(run.id)
+        return batch
 
     def _run_event_dirs(self, runs):
         """Maps run id -> list of dirs holding that run's event files.
@@ -535,53 +569,63 @@ class RunIndex:
         A run with no event dirs is recorded as such, so "no events" is
         distinguishable from "not yet scanned" and does not re-walk forever.
         """
-        recorded = self._recorded_event_dirs(runs)
+        from guild import batch_util
+
+        recorded = self._recorded_scans(runs)
         dirs = {}
         new_records = []
         for run in runs:
             status = run.status
-            cached = recorded.get(run.id)
-            if cached is not None and cached[0] == status:
+            scan = recorded.get(run.id)
+            if scan is not None and scan[0] == status:
                 dirs[run.id] = [
-                    os.path.join(run.dir, p) if p else run.dir for p in cached[1]
+                    (os.path.join(run.dir, prefix) if prefix else run.dir, has_attrs)
+                    for prefix, has_attrs in scan[1]
                 ]
                 continue
-            found = tfevent.event_dirs(run.dir)
+            found = tfevent.scan_event_dirs(run.dir)
             dirs[run.id] = found
             new_records.append(
                 (
                     run.id,
                     status,
-                    json.dumps([_scalar_prefix(p, run.dir) for p in found]),
+                    json.dumps(
+                        [
+                            [_scalar_prefix(path, run.dir), has_attrs]
+                            for path, has_attrs in found
+                        ]
+                    ),
+                    1 if batch_util.is_batch(run) else 0,
                 )
             )
         if new_records:
             self._write_run_scans(new_records)
         return dirs
 
-    def _recorded_event_dirs(self, runs):
+    def _recorded_scans(self, runs):
+        """Maps run id -> (status, [(prefix, has_attrs)], is_batch)."""
         recorded = {}
         for chunk in _id_chunks(runs):
             placeholders = ", ".join("?" for _ in chunk)
             try:
                 rows = self._db.execute(
-                    f"SELECT run, status, prefixes FROM run_scan "
+                    f"SELECT run, status, prefixes, is_batch FROM run_scan "
                     f"WHERE run IN ({placeholders})",
                     chunk,
                 )
             except sqlite3.OperationalError:
                 return {}
-            for run_id, status, prefixes in rows:
+            for run_id, status, prefixes, is_batch in rows:
                 decoded = _decode_scan_prefixes(prefixes)
                 if decoded is not None:
-                    recorded[run_id] = (status, decoded)
+                    recorded[run_id] = (status, decoded, bool(is_batch))
         return recorded
 
     def _write_run_scans(self, records):
         try:
             self._db.executemany(
-                "INSERT OR REPLACE INTO run_scan (run, status, prefixes) "
-                "VALUES (?, ?, ?)",
+                "INSERT OR REPLACE INTO run_scan "
+                "(run, status, prefixes, is_batch) VALUES (?, ?, ?, ?)",
                 records,
             )
             self._db.commit()
@@ -653,10 +697,14 @@ def _init_run_index_tables(db):
       CREATE TABLE IF NOT EXISTS run_scan (
         run TEXT PRIMARY KEY,
         status TEXT,
-        prefixes TEXT
+        prefixes TEXT,
+        is_batch INTEGER
       )
     """
     )
+    scan_cols = {row[1] for row in db.execute("PRAGMA table_info(run_scan)").fetchall()}
+    if "is_batch" not in scan_cols:
+        db.execute("ALTER TABLE run_scan ADD COLUMN is_batch INTEGER")
 
 
 def iter_run_scalars(run):

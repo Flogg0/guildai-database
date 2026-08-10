@@ -1730,6 +1730,12 @@ def for_run(run):
 
 def _for_guildfile_ref(run):
     guildfile_path = os.path.join(run.dir, run.opref.pkg_name)
+    # Check the cache before testing the path. Every run of an operation
+    # resolves the same guildfile, so once it is loaded the isfile() below is
+    # a repeated stat of a file we are holding in memory.
+    cached = _cache.get(_cache_key(guildfile_path))
+    if cached:
+        return cached
     if not os.path.isfile(guildfile_path):
         raise GuildfileMissing(guildfile_path)
     return for_file(guildfile_path)

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import contextlib
 import json
 import os
 import random
@@ -110,6 +111,7 @@ class Run:
         self._attr_buffer = None
         self._attrs_blob = None
         self._attrs_blob_mtime = None
+        self._attrs_blob_pinned = False
         self._props = util.PropertyCache(
             [
                 ("timestamp", None, self._get_timestamp, 1.0),
@@ -347,6 +349,8 @@ class Run:
         same yaml-encoded text as the per-attr files, so values decode
         identically via _load_attr.
         """
+        if self._attrs_blob_pinned and self._attrs_blob is not None:
+            return self._attrs_blob
         path = self._attrs_blob_path()
         try:
             st = os.stat(path)
@@ -365,6 +369,23 @@ class Run:
             self._attrs_blob = {}
             self._attrs_blob_mtime = None
         return self._attrs_blob
+
+    @contextlib.contextmanager
+    def pinned_attrs(self):
+        """Serves attr reads from a single blob load for the duration.
+
+        Reading several attrs from one run normally re-stats attrs.json before
+        each one, so a long-lived Run still sees a rewrite by another process.
+        A caller taking a point-in-time view of a run (an index refresh reads
+        a handful of attrs back to back) gains nothing from revalidating
+        between those reads and pays a round-trip for each.
+        """
+        prev = self._attrs_blob_pinned
+        self._attrs_blob_pinned = True
+        try:
+            yield self
+        finally:
+            self._attrs_blob_pinned = prev
 
     def attr_blob_encoded(self, name):
         """Raw yaml-encoded text for `name` from the consolidated blob, or

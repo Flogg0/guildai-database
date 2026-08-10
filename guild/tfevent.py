@@ -108,7 +108,7 @@ def scalar_readers(root_path, dirs=None):
     scalars in dir.
 
     `dirs` is an optional list of known event dirs. When provided, those
-    dirs are used as-is and `root_path` is not searched -- callers that
+    dirs are used as-is and `root_path` is not searched — callers that
     already know where a run's events live (e.g. from the run index) can
     skip the directory walk entirely.
     """
@@ -118,14 +118,24 @@ def scalar_readers(root_path, dirs=None):
         yield subdir_path, digest, ScalarReader(subdir_path)
 
 
-def event_dirs(root_path):
-    """Returns the list of dirs under root_path containing event files.
+def scan_event_dirs(root_path):
+    """Returns [(dir, has_attr_events)] for dirs under root_path with events.
 
     This is the directory walk that `scalar_readers` and `attr_readers`
-    perform implicitly. Callers that cache the result across invocations
-    use it directly and then pass `dirs` to the readers.
+    perform implicitly. Callers that cache the result across invocations use
+    it directly and then pass `dirs` to the readers.
+
+    `has_attr_events` is True when the dir holds summary files carrying logged
+    attrs, which is all `attr_readers` cares about. Recording it lets a caller
+    skip the attr read for dirs that only hold scalars - otherwise every such
+    dir is listed again just to discover there is nothing to read.
     """
-    return list(_tfevent_subdirs(root_path))
+    found = []
+    for root, dirs, files in os.walk(root_path, followlinks=True):
+        _del_non_run_linked_dirs(dirs, root)
+        if any(_is_event_file(name) for name in files):
+            found.append((root, any(_is_summary_attrs(name) for name in files)))
+    return found
 
 
 def _tfevent_subdirs(dir):

@@ -18,7 +18,6 @@ import logging
 import os
 import sys
 
-from guild import batch_util
 from guild import cli
 from guild import cmd_impl_support
 from guild import config
@@ -167,7 +166,7 @@ def _get_data_cb(args, index, format_cells=True, skip_header_if_empty=False):
 def _compare_data(args, index, format_cells, skip_header_if_empty):
     log_capture = util.LogCapture()
     with log_capture:
-        runs = _runs_for_args(args)
+        runs = _runs_for_args(args, index)
         index.refresh(runs)
         cols_table = _cols_table(runs, args, index)
         table = _resolve_table_cols(cols_table, index)
@@ -187,11 +186,12 @@ def _compare_data(args, index, format_cells, skip_header_if_empty):
         return [header] + rows, log
 
 
-def _runs_for_args(args):
+def _runs_for_args(args, index):
     runs = runs_impl.runs_for_args(args)
     if args.include_batch:
         return runs
-    return [run for run in runs if not batch_util.is_batch(run)]
+    batch = index.batch_runs(runs)
+    return [run for run in runs if run.id not in batch]
 
 
 def _cols_table(runs, args, index):
