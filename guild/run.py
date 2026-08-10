@@ -302,12 +302,30 @@ class Run:
         ("flags", "tags", "label", "started", "stopped", "initialized")
     )
 
+    # Attrs written once at run init and never mutated. When the index has a
+    # row for the run its value is definitive, so an absent attr is answered
+    # without touching the run dir at all -- unlike _INDEX_READABLE, where a
+    # missing value falls through to the filesystem. A NULL column means the
+    # row predates the attr being indexed, which does fall through.
+    _INDEX_INIT_ATTRS = frozenset(("sourcecode_digest", "opdef_attrs", "compare"))
+
     def __getitem__(self, name):
         if name in self._INDEX_READABLE:
             row = self._ensure_index_row()
             val = row.get(name)
             if val is not None:
                 return val
+        elif name in self._INDEX_INIT_ATTRS and self._attr_buffer is None:
+            indexed = self._ensure_index_row().get(name)
+            if indexed is not None:
+                if indexed == "":
+                    raise KeyError(name)
+                if name == "sourcecode_digest":
+                    return indexed
+                try:
+                    return json.loads(indexed)
+                except ValueError:
+                    pass
         # Read order: pending write buffer, then a per-attr file, then the
         # consolidated attr blob. A per-attr file wins over the blob so a later
         # write_attr() can override a value brought in via the blob -- e.g.
@@ -456,7 +474,10 @@ class Run:
         return os.path.join(*((self._guild_dir,) + tuple(subpath)))
 
     _INDEX_ATTRS = frozenset(
-        ("flags", "tags", "label", "started", "stopped", "initialized")
+        (
+            "flags", "tags", "label", "started", "stopped", "initialized",
+            "sourcecode_digest", "opdef_attrs", "compare",
+        )
     )
 
     def write_attr(self, name, val, raw=False):

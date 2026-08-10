@@ -187,9 +187,13 @@ class ScalarReader:
         dirty = False
         for run in runs:
             dirs = event_dirs.get(run.id)
-            if dirs is not None and not dirs:
+            if dirs is None:
+                readers = tfevent.scalar_readers(run.dir)
+            elif not dirs:
                 continue
-            for path, cur_digest, reader in tfevent.scalar_readers(run.dir, dirs=dirs):
+            else:
+                readers = tfevent.scalar_readers_for(dirs)
+            for path, cur_digest, reader in readers:
                 if self._maybe_refresh_run_scalars(run, path, cur_digest, reader):
                     dirty = True
         if dirty:
@@ -408,9 +412,9 @@ def _decode_scan_prefixes(encoded):
     """Decodes a run_scan prefixes payload, or None if unrecognized.
 
     This is a derived cache and the payload shape has changed between Guild
-    versions -- it previously held bare prefixes, and now (prefix, has_attrs)
-    pairs. A record this version cannot read means "rescan this run", never an
-    error.
+    versions -- it previously held bare prefixes, then (prefix, has_attrs)
+    pairs, and now (prefix, has_attrs, event_filenames). A record this version
+    cannot read means "rescan this run", never an error.
     """
     try:
         decoded = json.loads(encoded)
@@ -419,9 +423,10 @@ def _decode_scan_prefixes(encoded):
     if not isinstance(decoded, list):
         return None
     for item in decoded:
-        if not isinstance(item, list) or len(item) != 2:
+        if not isinstance(item, list) or len(item) != 3:
             return None
-        if not isinstance(item[0], str):
+        prefix, _has_attrs, names = item
+        if not isinstance(prefix, str) or not isinstance(names, list):
             return None
     return decoded
 
@@ -523,7 +528,7 @@ class RunIndex:
         if types is None or "attr" in types:
             # Only dirs that actually hold logged attrs are worth reading.
             attr_dirs = {
-                run_id: [path for path, has_attrs in dirs if has_attrs]
+                run_id: [path for path, has_attrs, _names in dirs if has_attrs]
                 for run_id, dirs in scanned.items()
             }
             self._attr_reader.refresh(runs, attr_dirs)
@@ -531,7 +536,7 @@ class RunIndex:
             self._flag_reader.refresh(runs)
         if types is None or "scalar" in types:
             scalar_dirs = {
-                run_id: [path for path, _has_attrs in dirs]
+                run_id: [(path, names) for path, _has_attrs, names in dirs]
                 for run_id, dirs in scanned.items()
             }
             self._scalar_reader.refresh(runs, scalar_dirs)
@@ -579,8 +584,12 @@ class RunIndex:
             scan = recorded.get(run.id)
             if scan is not None and scan[0] == status:
                 dirs[run.id] = [
-                    (os.path.join(run.dir, prefix) if prefix else run.dir, has_attrs)
-                    for prefix, has_attrs in scan[1]
+                    (
+                        os.path.join(run.dir, prefix) if prefix else run.dir,
+                        has_attrs,
+                        names,
+                    )
+                    for prefix, has_attrs, names in scan[1]
                 ]
                 continue
             found = tfevent.scan_event_dirs(run.dir)
@@ -591,8 +600,8 @@ class RunIndex:
                     status,
                     json.dumps(
                         [
-                            [_scalar_prefix(path, run.dir), has_attrs]
-                            for path, has_attrs in found
+                            [_scalar_prefix(path, run.dir), has_attrs, names]
+                            for path, has_attrs, names in found
                         ]
                     ),
                     1 if batch_util.is_batch(run) else 0,

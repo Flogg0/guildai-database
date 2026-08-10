@@ -22,6 +22,7 @@ import glob
 import hashlib
 import logging
 import os
+import stat
 
 from guild import tensorboard_util
 
@@ -118,8 +119,45 @@ def scalar_readers(root_path, dirs=None):
         yield subdir_path, digest, ScalarReader(subdir_path)
 
 
+def scalar_readers_for(dirs):
+    """Yields (dir, digest, reader) for known event dirs.
+
+    `dirs` is [(path, event_filenames)] as recorded by scan_event_dirs.
+    Knowing the filenames means the digest can be recomputed by stat'ing each
+    one, instead of listing the directory to discover them again. Falls back
+    to listing when the recorded names no longer match what is on disk.
+    """
+    _ensure_tb_logging_patched()
+    for path, names in dirs:
+        digest = _digest_for_known_files(path, names) if names else None
+        if digest is None:
+            digest = _event_files_digest(path)
+        yield path, digest, ScalarReader(path)
+
+
+def _digest_for_known_files(dir, names):
+    """Returns the events digest for dir computed from known filenames.
+
+    Returns None when the recorded names no longer describe the directory (a
+    file was removed or replaced by a non-file), so the caller can fall back
+    to a full listing. Must produce byte-identical input to
+    _event_files_digest for the same set of files.
+    """
+    to_hash = []
+    for name in sorted(names):
+        path = os.path.join(dir, name)
+        try:
+            st = os.stat(path)
+        except OSError:
+            return None
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        to_hash.append(f"{path}\n{st.st_size}")
+    return hashlib.md5("\n".join(to_hash).encode("utf-8")).hexdigest()
+
+
 def scan_event_dirs(root_path):
-    """Returns [(dir, has_attr_events)] for dirs under root_path with events.
+    """Returns [(dir, has_attr_events, event_filenames)] for dirs with events.
 
     This is the directory walk that `scalar_readers` and `attr_readers`
     perform implicitly. Callers that cache the result across invocations use
@@ -129,12 +167,22 @@ def scan_event_dirs(root_path):
     attrs, which is all `attr_readers` cares about. Recording it lets a caller
     skip the attr read for dirs that only hold scalars - otherwise every such
     dir is listed again just to discover there is nothing to read.
+
+    `event_filenames` are the dir's event logs, which let a caller recompute
+    the staleness digest without listing the dir again.
     """
     found = []
     for root, dirs, files in os.walk(root_path, followlinks=True):
         _del_non_run_linked_dirs(dirs, root)
-        if any(_is_event_file(name) for name in files):
-            found.append((root, any(_is_summary_attrs(name) for name in files)))
+        event_files = [name for name in files if _is_event_file(name)]
+        if event_files:
+            found.append(
+                (
+                    root,
+                    any(_is_summary_attrs(name) for name in files),
+                    sorted(event_files),
+                )
+            )
     return found
 
 

@@ -270,7 +270,10 @@ def _init_index_schema(conn):
         "  initialized INTEGER,"
         "  label TEXT,"
         "  flags TEXT,"
-        "  tags TEXT"
+        "  tags TEXT,"
+        "  sourcecode_digest TEXT,"
+        "  opdef_attrs TEXT,"
+        "  compare TEXT"
         ")"
     )
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
@@ -284,6 +287,9 @@ def _init_index_schema(conn):
         ("tags", "TEXT"),
         ("op_name", "TEXT"),
         ("stopped", "INTEGER"),
+        ("sourcecode_digest", "TEXT"),
+        ("opdef_attrs", "TEXT"),
+        ("compare", "TEXT"),
     ):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {col_type}")
@@ -858,7 +864,15 @@ INDEX_ROW_COLS = (
     "label",
     "flags",
     "tags",
+    "sourcecode_digest",
+    "opdef_attrs",
+    "compare",
 )
+
+# Attrs written once when a run is initialized and never mutated after. The
+# index row is authoritative for them: an empty string records "this run has
+# no such attr", which NULL (an un-migrated row) must not be confused with.
+INDEX_INIT_ATTR_COLS = ("sourcecode_digest", "opdef_attrs", "compare")
 
 INDEX_ROW_SQL = ", ".join(INDEX_ROW_COLS)
 
@@ -908,18 +922,31 @@ def _index_run_row(run):
             tags = json.dumps(t)
     except Exception:
         pass
+    # "" means "run has no such attr", which is a definitive answer -- see
+    # INDEX_INIT_ATTR_COLS.
+    sourcecode_digest = run.get("sourcecode_digest") or ""
+    opdef_attrs = _encoded_attr(run, "opdef_attrs")
+    compare = _encoded_attr(run, "compare")
     return (
         run.id, status, opref_str, op_name, started, stopped, initialized, label,
-        flags, tags
+        flags, tags, sourcecode_digest, opdef_attrs, compare
     )
+
+
+def _encoded_attr(run, name):
+    try:
+        val = run.get(name)
+    except Exception:
+        return ""
+    return json.dumps(val) if val else ""
 
 
 def _index_upsert_row(conn, row):
     conn.execute(
         "INSERT OR REPLACE INTO runs "
         "(run_id, status, opref, op_name, started, stopped, initialized, label, "
-        "flags, tags) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "flags, tags, sourcecode_digest, opdef_attrs, compare) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         row,
     )
 
@@ -951,29 +978,23 @@ def index_update_attr(run, name, val, root=None):
         "started": "started",
         "stopped": "stopped",
         "initialized": "initialized",
+        "sourcecode_digest": "sourcecode_digest",
     }
+    json_cols = ("flags", "tags", "opdef_attrs", "compare")
     pending = getattr(_index_local, 'pending_writes', None)
     if pending is not None:
         entry = pending.setdefault(run.id, {})
-        if name == "flags":
-            entry['flags'] = json.dumps(val) if val else ""
-        elif name == "tags":
-            entry['tags'] = json.dumps(val) if val else ""
+        if name in json_cols:
+            entry[name] = json.dumps(val) if val else ""
         elif name in col_map:
             entry[col_map[name]] = val
         return
     def _do():
         conn = _get_index_conn(root)
-        if name == "flags":
+        if name in json_cols:
             db_val = json.dumps(val) if val else ""
             conn.execute(
-                "UPDATE runs SET flags = ? WHERE run_id = ?",
-                (db_val, run.id),
-            )
-        elif name == "tags":
-            db_val = json.dumps(val) if val else ""
-            conn.execute(
-                "UPDATE runs SET tags = ? WHERE run_id = ?",
+                f"UPDATE runs SET {name} = ? WHERE run_id = ?",
                 (db_val, run.id),
             )
         elif name in col_map:
