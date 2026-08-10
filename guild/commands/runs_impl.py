@@ -1548,10 +1548,15 @@ def restage(args, ctx=None):
     no_runs = "Nothing to restage."
 
     def restage_f(selected):
-        # None means "one job per CPU" (resolved by the stager), matching
-        # guild-parallel-stager's default. -j 1 keeps the serial path.
+        # None means "one job per CPU", matching guild-parallel-stager's
+        # default, but never more workers than there are runs. -j 1 keeps the
+        # serial path.
         jobs = getattr(args, "jobs", None)
-        if jobs != 1 and len(selected) > 1:
+        if jobs is None:
+            jobs = _default_restage_jobs(len(selected))
+        else:
+            jobs = min(jobs, len(selected))
+        if jobs > 1 and len(selected) > 1:
             failed = _restage_runs_parallel(selected, jobs)
         else:
             # Batch the index writes across the whole set - each run's stage
@@ -1595,6 +1600,24 @@ def restage(args, ctx=None):
         False,
         select_runs_f,
     )
+
+
+def _default_restage_jobs(n_runs):
+    """One job per CPU, capped at the number of runs.
+
+    A worker pool costs a process spawn and a Guild import each; starting
+    more of them than there is work to do is pure overhead, and starting a
+    full machine's worth to restage two runs is enough to stall a loaded
+    host.
+    """
+    if n_runs <= 1:
+        return 1
+    try:
+        import joblib
+
+        return max(1, min(joblib.cpu_count(), n_runs))
+    except ImportError:
+        return 1
 
 
 def _restage_runs_parallel(runs, jobs):
