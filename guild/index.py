@@ -181,11 +181,14 @@ class ScalarReader:
         self._source_digests = None
         self._preloaded = None
 
-    def refresh(self, runs, event_dirs=None):
+    def refresh(self, runs, event_dirs=None, skip=None):
         event_dirs = event_dirs or {}
+        skip = skip or set()
         self._preload_source_digests(runs)
         dirty = False
         for run in runs:
+            if run.id in skip:
+                continue
             dirs = event_dirs.get(run.id)
             if dirs is None:
                 readers = tfevent.scalar_readers(run.dir)
@@ -500,6 +503,7 @@ class RunIndex:
     def __init__(self, path=None):
         self.path = path or var.cache_dir("runs")
         self._db = self._init_db()
+        self._clean = set()
         self._attr_reader = AttrReader()
         self._flag_reader = FlagReader()
         self._scalar_reader = ScalarReader(self._db)
@@ -524,6 +528,7 @@ class RunIndex:
         `types` is an optional list of data types to refresh.
         """
         needs_events = types is None or "attr" in types or "scalar" in types
+        self._clean = set()
         scanned = self._run_event_dirs(runs) if needs_events else {}
         if types is None or "attr" in types:
             # Only dirs that actually hold logged attrs are worth reading.
@@ -535,11 +540,15 @@ class RunIndex:
         if types is None or "flag" in types:
             self._flag_reader.refresh(runs)
         if types is None or "scalar" in types:
+            # A run the markers have not flagged since its last scan cannot
+            # have new events, so its cached scalars stand -- no digest, no
+            # directory access at all.
             scalar_dirs = {
                 run_id: [(path, names) for path, _has_attrs, names in dirs]
                 for run_id, dirs in scanned.items()
+                if run_id not in self._clean
             }
-            self._scalar_reader.refresh(runs, scalar_dirs)
+            self._scalar_reader.refresh(runs, scalar_dirs, skip=self._clean)
 
     def batch_runs(self, runs):
         """Returns the ids of `runs` that are batch runs.
@@ -554,7 +563,8 @@ class RunIndex:
         batch = set()
         for run in runs:
             scan = recorded.get(run.id)
-            if scan is not None and scan[0] == run.status:
+            stamp = run.index_sync_stamp
+            if scan is not None and stamp is not None and scan[0] == stamp:
                 if scan[2]:
                     batch.add(run.id)
             elif batch_util.is_batch(run):
@@ -580,9 +590,10 @@ class RunIndex:
         dirs = {}
         new_records = []
         for run in runs:
-            status = run.status
+            stamp = run.index_sync_stamp
             scan = recorded.get(run.id)
-            if scan is not None and scan[0] == status:
+            if scan is not None and stamp is not None and scan[0] == stamp:
+                self._clean.add(run.id)
                 dirs[run.id] = [
                     (
                         os.path.join(run.dir, prefix) if prefix else run.dir,
@@ -597,7 +608,7 @@ class RunIndex:
             new_records.append(
                 (
                     run.id,
-                    status,
+                    stamp,
                     json.dumps(
                         [
                             [_scalar_prefix(path, run.dir), has_attrs, names]
@@ -612,29 +623,29 @@ class RunIndex:
         return dirs
 
     def _recorded_scans(self, runs):
-        """Maps run id -> (status, [(prefix, has_attrs)], is_batch)."""
+        """Maps run id -> (synced_at, [(prefix, has_attrs, names)], is_batch)."""
         recorded = {}
         for chunk in _id_chunks(runs):
             placeholders = ", ".join("?" for _ in chunk)
             try:
                 rows = self._db.execute(
-                    f"SELECT run, status, prefixes, is_batch FROM run_scan "
+                    f"SELECT run, synced_at, prefixes, is_batch FROM run_scan "
                     f"WHERE run IN ({placeholders})",
                     chunk,
                 )
             except sqlite3.OperationalError:
                 return {}
-            for run_id, status, prefixes, is_batch in rows:
+            for run_id, synced_at, prefixes, is_batch in rows:
                 decoded = _decode_scan_prefixes(prefixes)
                 if decoded is not None:
-                    recorded[run_id] = (status, decoded, bool(is_batch))
+                    recorded[run_id] = (synced_at, decoded, bool(is_batch))
         return recorded
 
     def _write_run_scans(self, records):
         try:
             self._db.executemany(
                 "INSERT OR REPLACE INTO run_scan "
-                "(run, status, prefixes, is_batch) VALUES (?, ?, ?, ?)",
+                "(run, synced_at, prefixes, is_batch) VALUES (?, ?, ?, ?)",
                 records,
             )
             self._db.commit()
@@ -705,15 +716,16 @@ def _init_run_index_tables(db):
         """
       CREATE TABLE IF NOT EXISTS run_scan (
         run TEXT PRIMARY KEY,
-        status TEXT,
+        synced_at INTEGER,
         prefixes TEXT,
         is_batch INTEGER
       )
     """
     )
     scan_cols = {row[1] for row in db.execute("PRAGMA table_info(run_scan)").fetchall()}
-    if "is_batch" not in scan_cols:
-        db.execute("ALTER TABLE run_scan ADD COLUMN is_batch INTEGER")
+    for col in ("is_batch", "synced_at"):
+        if col not in scan_cols:
+            db.execute(f"ALTER TABLE run_scan ADD COLUMN {col} INTEGER")
 
 
 def iter_run_scalars(run):

@@ -273,7 +273,8 @@ def _init_index_schema(conn):
         "  tags TEXT,"
         "  sourcecode_digest TEXT,"
         "  opdef_attrs TEXT,"
-        "  compare TEXT"
+        "  compare TEXT,"
+        "  synced_at INTEGER"
         ")"
     )
     existing_cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
@@ -290,6 +291,7 @@ def _init_index_schema(conn):
         ("sourcecode_digest", "TEXT"),
         ("opdef_attrs", "TEXT"),
         ("compare", "TEXT"),
+        ("synced_at", "INTEGER"),
     ):
         if col not in existing_cols:
             conn.execute(f"ALTER TABLE runs ADD COLUMN {col} {col_type}")
@@ -867,7 +869,17 @@ INDEX_ROW_COLS = (
     "sourcecode_digest",
     "opdef_attrs",
     "compare",
+    "synced_at",
 )
+
+# Stamp bumped every time a run's row is written from disk, i.e. every time
+# the dirty-marker protocol decides the run needs resyncing. Derived caches
+# record it and use a change as their invalidation signal, so freshness has
+# exactly the two states the markers define: the run is dirty and gets
+# re-read, or it is not and the index answers for it.
+def _sync_stamp():
+    return time.time_ns()
+
 
 # Attrs written once when a run is initialized and never mutated after. The
 # index row is authoritative for them: an empty string records "this run has
@@ -929,7 +941,7 @@ def _index_run_row(run):
     compare = _encoded_attr(run, "compare")
     return (
         run.id, status, opref_str, op_name, started, stopped, initialized, label,
-        flags, tags, sourcecode_digest, opdef_attrs, compare
+        flags, tags, sourcecode_digest, opdef_attrs, compare, _sync_stamp()
     )
 
 
@@ -945,8 +957,8 @@ def _index_upsert_row(conn, row):
     conn.execute(
         "INSERT OR REPLACE INTO runs "
         "(run_id, status, opref, op_name, started, stopped, initialized, label, "
-        "flags, tags, sourcecode_digest, opdef_attrs, compare) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "flags, tags, sourcecode_digest, opdef_attrs, compare, synced_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         row,
     )
 
@@ -962,9 +974,11 @@ def index_update_status(run, status, root=None):
         return
     def _do():
         conn = _get_index_conn(root)
+        # A status change means the run was written to, so bump the stamp:
+        # derived caches must re-read it.
         conn.execute(
-            "UPDATE runs SET status = ? WHERE run_id = ?",
-            (status, run.id),
+            "UPDATE runs SET status = ?, synced_at = ? WHERE run_id = ?",
+            (status, _sync_stamp(), run.id),
         )
         if conn.total_changes == 0:
             _index_upsert_run(conn, run)

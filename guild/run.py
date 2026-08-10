@@ -152,6 +152,16 @@ class Run:
         return self.id[:8]
 
     @property
+    def index_sync_stamp(self):
+        """Stamp of the last time this run's index row was written from disk.
+
+        None when the run has no row, or the row predates the stamp. Derived
+        caches key on it: unchanged stamp means the dirty-marker protocol has
+        not seen a write to this run, so what the index holds is current.
+        """
+        return self._ensure_index_row().get("synced_at")
+
+    @property
     def indexed_op_name(self):
         """The formatted operation name recorded in the run index, if any.
 
@@ -315,6 +325,11 @@ class Run:
             val = row.get(name)
             if val is not None:
                 return val
+            if row.get("synced_at") is not None:
+                # The row was written from disk in full, so a missing value
+                # means the run has no such attr - an answer, not a cache
+                # miss to resolve against the filesystem.
+                raise KeyError(name)
         elif name in self._INDEX_INIT_ATTRS and self._attr_buffer is None:
             indexed = self._ensure_index_row().get(name)
             if indexed is not None:
