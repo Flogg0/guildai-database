@@ -12,6 +12,9 @@ click>=8
 daemonize>=2.4.7
 debugpy
 filelock>=3.0.12
+joblib
+pandas
+tqdm
 importlib-metadata;python_version<"3.8"
 jinja2>=3.0.3
 natsort
