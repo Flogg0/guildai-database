@@ -561,7 +561,7 @@ def _get_index_conn(root=None):
     return conn
 
 
-def _index_safe_write(fn, root=None, run_id=None):
+def _index_safe_write(fn, root=None, run_id=None, run_ids=None):
     """Run fn under the index lock, retrying once on transient errors.
 
     Only rebuilds the index when SQLite reports actual file-level
@@ -572,7 +572,9 @@ def _index_safe_write(fn, root=None, run_id=None):
     In worker (writes-disabled) mode, fn is skipped and a dirty marker is
     touched instead. When run_id is given, the per-run marker is touched so
     the next headnode read can delta-sync only that run; otherwise the
-    global marker is touched, forcing a full resync.
+    global marker is touched, forcing a full resync. run_ids is the
+    many-runs form of run_id, for a write that covers a known set of runs
+    (a batched stale-row prune) rather than one.
 
     Inside an index_batch_writes() scope the marker is not written here but
     deferred: the run_id is collected and a single marker per run is emitted
@@ -581,14 +583,16 @@ def _index_safe_write(fn, root=None, run_id=None):
     the same per-run marker file ~7 times, one NFS write each.
     """
     if _writes_disabled():
+        ids = [run_id] if run_ids is None else list(run_ids)
         pending = getattr(_index_local, 'pending_markers', None)
         if pending is not None:
-            pending.add(run_id)
+            pending.update(ids)
             return
-        if run_id is not None:
-            _touch_run_dirty_marker(root, run_id)
-        else:
-            _touch_dirty_marker(root)
+        for rid in ids:
+            if rid is not None:
+                _touch_run_dirty_marker(root, rid)
+            else:
+                _touch_dirty_marker(root)
         return
     try:
         with _get_index_lock(root):
@@ -1410,7 +1414,11 @@ def index_query_runs(root=None, filter_expr=None, base_sql=None,
         def _do():
             conn.executemany("DELETE FROM runs WHERE run_id = ?", stale)
             conn.commit()
-        _index_safe_write(_do, root)
+        # Per-run markers, not the global one: this prune names the exact
+        # runs it drops, and _do_delta_sync already deletes the row for a
+        # run whose dir has no opref. Escalating to the global marker would
+        # make a worker's read force a full resync of every on-disk run.
+        _index_safe_write(_do, root, run_ids=[rid for (rid,) in stale])
     return result
 
 
@@ -1600,7 +1608,9 @@ def _iter_dirs(root):
                         "DELETE FROM runs WHERE run_id = ?", stale
                     )
                     conn.commit()
-                _index_safe_write(_do, root)
+                _index_safe_write(
+                    _do, root, run_ids=[name for (name,) in stale]
+                )
             return
     except sqlite3.DatabaseError as e:
         if _is_corruption_error(e):

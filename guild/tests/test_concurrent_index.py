@@ -1405,6 +1405,135 @@ def test_parallel_delta_sync_matches_serial():
         return False
 
 
+def test_worker_stale_prune_does_not_force_full_resync():
+    """A writes-disabled worker reading runs with a stale index row must mark
+    only those runs dirty. Escalating to the global marker would turn the next
+    resync into a full re-read of every run on disk."""
+    print(f"\n=== Test: worker stale prune does not force full resync ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        ids = ["a" * 32, "b" * 32, "c" * 32]
+        for rid in ids:
+            _make_run_dir(runs_dir_path, rid, status="completed")
+            run = runlib.Run(rid, os.path.join(runs_dir_path, rid))
+            gvar.index_register_run(run, root=runs_dir_path)
+            gvar.index_update_status(run, "completed", root=runs_dir_path)
+        db_path = gvar._index_db_path(runs_dir_path)
+        gone_id = ids[0]
+
+        # A run leaves disk (deleted or purged) while its index row survives.
+        shutil.rmtree(os.path.join(runs_dir_path, gone_id))
+
+        # A worker reads. Pruning the stale row is a write it cannot do, so
+        # it defers -- and what it defers to decides the next resync's cost.
+        os.environ[gvar._NO_INDEX_WRITES_ENV] = "1"
+        gvar._drop_cached_conn(f"conn_{db_path}")
+        try:
+            rows = gvar.index_query_runs(root=runs_dir_path)
+        finally:
+            os.environ.pop(gvar._NO_INDEX_WRITES_ENV, None)
+
+        assert len(rows) == 2, f"query returned {len(rows)} runs, want 2"
+        assert not os.path.exists(db_path + ".dirty"), (
+            "worker read touched the global dirty marker — the next resync "
+            "would re-read every run on disk, not just the stale one"
+        )
+        markers = sorted(os.listdir(db_path + ".dirty.d"))
+        assert markers == [gone_id], (
+            f"want a per-run marker for {gone_id} only, got {markers}"
+        )
+
+        # The headnode resync must delta-sync that one run and drop its row.
+        full_syncs = []
+        orig_full = gvar._do_index_sync
+        gvar._do_index_sync = lambda *args, **kw: full_syncs.append(1)
+        try:
+            gvar._drop_cached_conn(f"conn_{db_path}")
+            conn = gvar._get_index_conn(runs_dir_path)
+        finally:
+            gvar._do_index_sync = orig_full
+
+        assert not full_syncs, "resync did a full filesystem sync, not a delta"
+        left = {r[0] for r in conn.execute("SELECT run_id FROM runs")}
+        assert left == set(ids[1:]), f"stale row not pruned by resync: {left}"
+        assert not os.listdir(db_path + ".dirty.d"), (
+            "per-run marker not cleared after the resync deleted the row"
+        )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_worker_stale_prune_in_batch_scope():
+    """Same prune inside an index_batch_writes() scope: the batch collects the
+    stale run ids and emits per-run markers at exit. A None in that set forces
+    the global marker for every run written in the batch."""
+    print(f"\n=== Test: worker stale prune inside batch scope ===")
+    tmpdir = tempfile.mkdtemp(prefix="guild_test_")
+    runs_dir_path = os.path.join(tmpdir, "runs")
+    os.makedirs(runs_dir_path, exist_ok=True)
+    os.environ["GUILD_HOME"] = tmpdir
+    for mod in list(sys.modules):
+        if mod.startswith("guild"):
+            sys.modules.pop(mod, None)
+    from guild import var as gvar
+    from guild import run as runlib
+
+    try:
+        gone_id = "d" * 32
+        keep_id = "e" * 32
+        for rid in (gone_id, keep_id):
+            _make_run_dir(runs_dir_path, rid, status="completed")
+            run = runlib.Run(rid, os.path.join(runs_dir_path, rid))
+            gvar.index_register_run(run, root=runs_dir_path)
+            gvar.index_update_status(run, "completed", root=runs_dir_path)
+        db_path = gvar._index_db_path(runs_dir_path)
+        shutil.rmtree(os.path.join(runs_dir_path, gone_id))
+
+        # A staged run written in the same batch as the offending read.
+        staged_id = "f" * 32
+        _make_run_dir(runs_dir_path, staged_id, status="completed")
+        staged = runlib.Run(staged_id, os.path.join(runs_dir_path, staged_id))
+
+        os.environ[gvar._NO_INDEX_WRITES_ENV] = "1"
+        gvar._drop_cached_conn(f"conn_{db_path}")
+        try:
+            with gvar.index_batch_writes(root=runs_dir_path):
+                gvar.index_register_run(staged, root=runs_dir_path)
+                gvar.index_query_runs(root=runs_dir_path)
+        finally:
+            os.environ.pop(gvar._NO_INDEX_WRITES_ENV, None)
+
+        assert not os.path.exists(db_path + ".dirty"), (
+            "stale prune inside a batch escalated the whole batch to the "
+            "global dirty marker"
+        )
+        markers = sorted(os.listdir(db_path + ".dirty.d"))
+        assert markers == sorted([gone_id, staged_id]), (
+            f"want per-run markers for the stale and staged runs, got {markers}"
+        )
+        print(f"  [PASS]")
+        return True
+    except AssertionError as e:
+        print(f"  [FAIL] {e}")
+        return False
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     mp.set_start_method("fork", force=True)
     results = {}
@@ -1428,6 +1557,8 @@ if __name__ == "__main__":
     results["per_run_marker_triggers_delta_sync"] = test_per_run_marker_triggers_delta_sync()
     results["per_run_marker_survives_in_flight"] = test_per_run_marker_survives_in_flight()
     results["parallel_delta_sync_matches_serial"] = test_parallel_delta_sync_matches_serial()
+    results["worker_stale_prune_does_not_force_full_resync"] = test_worker_stale_prune_does_not_force_full_resync()
+    results["worker_stale_prune_in_batch_scope"] = test_worker_stale_prune_in_batch_scope()
 
     print("\n" + "=" * 50)
     print("SUMMARY:")
