@@ -137,6 +137,15 @@ Behavioral details:
   their own reads — only "headnode" (unset env var) invocations do the
   resync. This avoids thundering-herd syncs when many workers start at
   once.
+- A worker's *read* can still owe the index a write: `index_query_runs` and
+  `iter_run_dirs` prune rows for runs whose directory is gone. With writes
+  disabled that prune is deferred as one marker per pruned run, not the
+  global marker — a delta sync already deletes the row for a run whose dir
+  has no opref, so the deferred delete is expressed exactly. Escalating
+  instead would let a single worker read force a re-read of every run on
+  disk: measured over a synthetic store with one stale row, the resync took
+  385ms and re-read 3999 runs at 4000 total (linear in the total), versus
+  ~1ms and no run reads via the delta path (flat in the total).
 - Per-run marker freshness is tracked by `mtime`, compared against the
   `dirty_synced_mtime` recorded for *that run* — the mtime of the marker it
   was last re-read for. Comparing against the index DB file's mtime (as this
