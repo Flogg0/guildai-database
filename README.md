@@ -180,7 +180,9 @@ In-flight runs (no `exit_status` yet, no `STAGED`/`PENDING`/`LOCK.remote`
 marker) are skipped by the resync: on another NFS host their status would
 degrade to `error` via a local-PID check. The per-run marker for an
 in-flight run is left in place so the next sync retries after the worker
-writes `exit_status`.
+writes `exit_status`. A restarted run clears its previous `exit_status` when
+its directory is reused, so it counts as in-flight for the whole of the new
+run rather than being reported with the previous cycle's outcome.
 
 ### Parallelizing the resync read phase: `GUILD_RESYNC_WORKERS`
 
@@ -270,8 +272,16 @@ Each run is restaged **in place** — it keeps its ID, run directory,
 operation, and flags, and its dependencies are re-resolved. Files written by
 a previous start are *not* removed; use `guild run --proto RUN` instead to
 start from a clean run directory. Note that staging sets a run's start time,
-so restaged runs sort to the top of `guild runs`; because they are restaged
-in parallel, their order relative to *each other* is not defined.
+so restaged runs sort to the top of `guild runs`. Under the parallel default
+(below) their order relative to *each other* is not defined; `-j 1` restages
+in selection order.
+
+A restaged run has not run yet, so the previous cycle's `stopped` time and
+`exit_status` are cleared when its run directory is reused. Otherwise the
+fresh start time would pair with the old stop time and the run would report
+a negative duration — `-301:59:23` for a run restaged 300 hours after it
+finished — until it ran again. A staged run therefore has no duration, and
+its start time is always the start of the run it is about to make.
 
 If a run can't be restaged (e.g. it's missing its op configuration), it is
 reported as a warning and the rest of the batch still restages; the command
@@ -280,12 +290,13 @@ then exits non-zero.
 Restaging is not a status flip: each run gets a full staging cycle, so a
 large restage is latency-bound on networked storage (~95 filesystem
 operations per run). Runs are therefore restaged **in parallel by default**,
-one job per CPU, reusing the same machinery as `guild-parallel-stager`: each
-worker invokes Guild's entrypoint in-process (skipping interpreter startup
-per run) with per-run index writes disabled, and the dirty markers they leave
-are folded in by a single delta sync at the end.
+one job per CPU but never more workers than there are runs, reusing the same
+machinery as `guild-parallel-stager`: each worker invokes Guild's entrypoint
+in-process (skipping interpreter startup per run) with per-run index writes
+disabled, and the dirty markers they leave are folded in by a single delta
+sync at the end.
 
-    guild runs restage -Se -y                 # parallel, one job per CPU
+    guild runs restage -Se -y                 # parallel, up to one job per CPU
     guild runs restage -Se -y -j 8            # cap at 8 workers
     guild runs restage -Se -y -j 1            # serial, in this process
 

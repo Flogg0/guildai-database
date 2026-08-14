@@ -411,10 +411,13 @@ def _op_finalize_run_attrs(run, exit_status):
     op_util.delete_proc_lock(run)
     from guild import var
     status = "completed" if exit_status == 0 else "error"
-    # Batch the finalization writes so all are flushed together.
+    # Batch the finalization writes so all are flushed together. `started`
+    # needs no re-assert here: set_run_running wrote it through write_attr,
+    # which indexes it. Re-asserting it read the value back out of the index
+    # first, so a restarted run wrote its *previous* start time back over the
+    # current one.
     with var.index_batch_writes():
         var.index_update_status(run, status)
-        var.index_update_attr(run, "started", run.get("started"))
 
 
 # =================================================================
