@@ -98,3 +98,61 @@ Nothing is restaged when the prompt is declined.
 
     >>> run("guild runs restage -Fo not-an-op -y")
     Nothing to restage.
+
+## Run timestamps across a restage
+
+Restaging stamps a fresh start time, but the run has not run yet, so the
+previous cycle's stop time and exit status are cleared. Left in place,
+they would pair a new start time with an old stop time and read back as
+a negative duration.
+
+    >>> from guild import run_util
+    >>> from guild import var
+
+    >>> bonjour = run_capture("guild select -F 'msg = bonjour'")
+
+    >>> staged = var.get_run(bonjour)
+
+    >>> staged.status
+    'staged'
+
+    >>> staged.get("stopped") is None
+    True
+
+    >>> staged.get("exit_status") is None
+    True
+
+    >>> run_util.run_duration(staged) is None
+    True
+
+Starting the run stamps the time it actually ran, not the time it was
+staged.
+
+    >>> staged_at = staged.get("started")
+
+    >>> run(f"guild run --start {bonjour} -y")
+    bonjour
+
+    >>> restarted = var.get_run(bonjour)
+
+    >>> restarted.status
+    'completed'
+
+    >>> restarted.get("started") > staged_at
+    True
+
+The index and the run dir are read by different code paths, so they are
+checked against each other - a stale index start time inflates a run's
+duration by however long it sat staged.
+
+    >>> attr_path = path(
+    ...     guild_home(), "runs", bonjour, ".guild", "attrs", "started")
+
+    >>> with open(attr_path) as f:
+    ...     on_disk = int(f.read())
+
+    >>> restarted.get("started") == on_disk
+    True
+
+    >>> restarted.get("stopped") >= on_disk
+    True

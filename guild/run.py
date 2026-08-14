@@ -523,6 +523,14 @@ class Run:
         if not self.has_attr("initialized"):
             self.write_attr("id", self.id)
             self.write_attr("initialized", timestamp())
+        else:
+            # The run dir is being reused (restart/restage). The previous
+            # cycle's terminal attrs describe an execution that is over:
+            # leaving them pairs a fresh `started` with a stale `stopped`,
+            # which reads back as a negative duration. `initialized` is
+            # already stat'd above, so this costs nothing for a new run.
+            self.del_attr("stopped")
+            self.del_attr("exit_status")
 
     def guild_path(self, *subpath):
         if subpath is None:
@@ -555,9 +563,16 @@ class Run:
         # parsed blob would make the next attr read re-open and re-parse a
         # file that has not changed.
         if name in self._INDEX_ATTRS:
+            indexed_val = val if not raw else encoded
+            # Keep the cached index row in step with the write. Without this a
+            # later self[name] serves the pre-write value from the cache (the
+            # row is only re-read when _index_row is None), which read back
+            # into an index write would clobber the value just written.
+            if self._index_row is not None:
+                self._index_row[name] = indexed_val
             try:
                 from guild import var
-                var.index_update_attr(self, name, val if not raw else encoded)
+                var.index_update_attr(self, name, indexed_val)
             except Exception:
                 pass
 
@@ -590,6 +605,10 @@ class Run:
         # deleted index attr (e.g. `guild label --clear`) would still read back
         # the stale value from the SQLite index.
         if name in self._INDEX_ATTRS:
+            # Mirror write_attr: a NULL in the cached row means "unknown", so
+            # the next read falls through to the run dir and sees the deletion.
+            if self._index_row is not None:
+                self._index_row[name] = None
             try:
                 from guild import var
                 var.index_update_attr(self, name, None)
