@@ -180,7 +180,9 @@ In-flight runs (no `exit_status` yet, no `STAGED`/`PENDING`/`LOCK.remote`
 marker) are skipped by the resync: on another NFS host their status would
 degrade to `error` via a local-PID check. The per-run marker for an
 in-flight run is left in place so the next sync retries after the worker
-writes `exit_status`.
+writes `exit_status`. A restarted run clears its previous `exit_status` when
+its directory is reused, so it counts as in-flight for the whole of the new
+run rather than being reported with the previous cycle's outcome.
 
 ### Parallelizing the resync read phase: `GUILD_RESYNC_WORKERS`
 
@@ -273,6 +275,13 @@ start from a clean run directory. Note that staging sets a run's start time,
 so restaged runs sort to the top of `guild runs`. Under the parallel default
 (below) their order relative to *each other* is not defined; `-j 1` restages
 in selection order.
+
+A restaged run has not run yet, so the previous cycle's `stopped` time and
+`exit_status` are cleared when its run directory is reused. Otherwise the
+fresh start time would pair with the old stop time and the run would report
+a negative duration — `-301:59:23` for a run restaged 300 hours after it
+finished — until it ran again. A staged run therefore has no duration, and
+its start time is always the start of the run it is about to make.
 
 If a run can't be restaged (e.g. it's missing its op configuration), it is
 reported as a warning and the rest of the batch still restages; the command
