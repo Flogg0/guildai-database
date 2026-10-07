@@ -25,6 +25,18 @@ from . import runs_support
 @runs_support.all_filters
 @remote_support.remote_option("Permanently delete remote runs.")
 @click.option("-y", "--yes", help="Do not prompt before purging.", is_flag=True)
+@click.option(
+    "-j",
+    "--jobs",
+    metavar="N",
+    type=click.IntRange(min=1),
+    default=1,
+    help=(
+        "Purge N runs in parallel. Each file in a run is a separate delete, "
+        "a round-trip apiece on a networked filesystem; parallel jobs "
+        "overlap them. On a local disk the default (1) is usually fastest."
+    ),
+)
 @click.pass_context
 @click_util.use_args
 @click_util.render_doc

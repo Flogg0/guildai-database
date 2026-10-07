@@ -9,4 +9,6 @@ this fork. Exposes two console scripts (see guildai.dist-info/entry_points.txt):
   process per trial.
 - ``guild-slurm-runner`` (guild_runner): select staged runs and execute them,
   either directly or by submitting SLURM batch jobs.
+- ``guild-parallel-delete`` (parallel_delete): ``guild runs delete`` (or
+  ``purge`` with ``--purge``) with parallel jobs, one per CPU by default.
 """
