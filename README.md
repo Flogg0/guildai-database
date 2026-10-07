@@ -223,16 +223,38 @@ connection is single-threaded), so the index result is byte-for-byte
 identical to a serial sync. Each worker thread takes the dirty-sync
 filesystem-fallback path, so a worker read never re-enters the index DB.
 
-- **Off by default (serial).** Threading only wins when reads are
-  filesystem-latency bound. On a *local* disk the reads are CPU bound
-  (opref/YAML parsing under the GIL) and extra threads only add contention
-  — measurably *slower*. So this is an opt-in for cluster/NAS staging; set
-  it in the staging job's environment, not globally.
+- **Off by default (serial)**, except for the end-of-stage sync of
+  `guild-parallel-stager` and `guild runs restage`, which use as many
+  threads as staging workers unless `GUILD_RESYNC_WORKERS` is set. Threading
+  only wins when reads are filesystem-latency bound. On a *local* disk the
+  reads are CPU bound (opref/YAML parsing under the GIL) and extra threads
+  only add contention — measurably *slower*. So elsewhere this is an opt-in
+  for cluster/NAS use; set it in the job's environment, not globally.
 - Modeling NAS latency (~37 ms of round-trips per run), 600 runs resynced
   in **22.6 s serial → 1.5 s with 16 threads** (~15×), with identical index
   output. Speedup is near-linear up to ~16 threads, then tapers.
 - Only engages for batches of ≥64 dirty runs; smaller (interactive) syncs
   stay serial regardless, since thread setup wouldn't pay off.
+
+### Fewer reads per dirty run
+
+The sync reads far less per run than it used to (~30 runs-dir syscalls per
+run before, ~5 now):
+
+- **Index rows in the markers.** A worker that writes a run (e.g. stages it)
+  stores the run's index row in the run's dirty marker at the end of the
+  write batch, so the sync takes it from there - checking only that the
+  run's `opref` still exists - instead of re-reading the run dir. Only a
+  settled status (staged, pending, completed, error, terminated) is taken
+  from a marker; a run still executing goes through the definitive-status
+  check and stays pending as before. A marker touched without a row (any
+  other worker write) is truncated, so a stored row never outlives the
+  state it describes; empty or unparsable markers fall back to the disk read.
+- **One look at the run dir otherwise.** When a run is read from disk
+  (fallback, full sync, registration), `Run.snapshot_reads()` lists `.guild`
+  and `.guild/attrs` once and loads `attrs.json` once, answering the status
+  markers and per-attr files from those listings instead of probing each
+  attr file and re-stat'ing `attrs.json` per attr.
 
 ## Rebuilding the index
 

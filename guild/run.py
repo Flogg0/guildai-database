@@ -129,6 +129,9 @@ class Run:
         self._attrs_blob = None
         self._attrs_blob_mtime = None
         self._attrs_blob_pinned = False
+        # (names in .guild, names in .guild/attrs) while snapshot_reads() is
+        # active, else None.
+        self._snapshot = None
         # Set by init_skel: True when it created the run dir, i.e. the run is
         # new and nothing from a previous run cycle can be on disk.
         self._dir_created = False
@@ -216,6 +219,8 @@ class Run:
         cached = row.get("opref")
         if cached:
             return cached
+        if self._snapshot is not None and "opref" not in self._snapshot[0]:
+            return None
         return util.try_read(self._opref_path())
 
     def _opref_path(self):
@@ -242,6 +247,8 @@ class Run:
         return self._props.get("pid")
 
     def _get_pid(self):
+        if self._snapshot is not None and "LOCK" not in self._snapshot[0]:
+            return None
         lockfile = self.guild_path("LOCK")
         try:
             raw = open(lockfile, "r").read(10)
@@ -259,13 +266,18 @@ class Run:
         cached = row.get("status")
         if cached:
             return cached
-        if os.path.exists(self.guild_path("LOCK.remote")):
+        if self._guild_entry_exists("LOCK.remote"):
             return "running"
-        if os.path.exists(self.guild_path("PENDING")):
+        if self._guild_entry_exists("PENDING"):
             return "pending"
-        if os.path.exists(self.guild_path("STAGED")):
+        if self._guild_entry_exists("STAGED"):
             return "staged"
         return self._local_status()
+
+    def _guild_entry_exists(self, name):
+        if self._snapshot is not None:
+            return name in self._snapshot[0]
+        return os.path.exists(self.guild_path(name))
 
     @property
     def remote(self):
@@ -287,6 +299,8 @@ class Run:
 
     @property
     def batch_proto(self):
+        if self._snapshot is not None and "proto" not in self._snapshot[0]:
+            return None
         proto_dir = self.guild_path("proto")
         proto_opref_path = os.path.join(proto_dir, ".guild", "opref")
         if os.path.exists(proto_opref_path):
@@ -372,13 +386,14 @@ class Run:
         buf = self._attr_buffer
         if buf is not None and name in buf:
             return _load_attr(buf[name])
-        try:
-            f = open(self._attr_path(name), "r")
-        except IOError:
-            pass
-        else:
-            with f:
-                return _load_attr(f.read())
+        if self._snapshot is None or name in self._snapshot[1]:
+            try:
+                f = open(self._attr_path(name), "r")
+            except IOError:
+                pass
+            else:
+                with f:
+                    return _load_attr(f.read())
         blob = self._load_attrs_blob()
         if name in blob:
             return _load_attr(blob[name])
@@ -415,6 +430,8 @@ class Run:
         """
         if self._attrs_blob_pinned and self._attrs_blob is not None:
             return self._attrs_blob
+        if self._snapshot is not None and self._attrs_blob is None:
+            return self._load_attrs_blob_for_snapshot()
         path = self._attrs_blob_path()
         try:
             st = os.stat(path)
@@ -446,6 +463,49 @@ class Run:
             self._attrs_blob = {}
             self._attrs_blob_mtime = None
         return self._attrs_blob
+
+    def _load_attrs_blob_for_snapshot(self):
+        # The listing already says whether attrs.json exists, and a fresh
+        # load needs no stamp comparison first: open it and take the stamp
+        # from the open file rather than stat'ing the path beforehand.
+        if "attrs.json" not in self._snapshot[0]:
+            return {}
+        try:
+            with open(self._attrs_blob_path()) as f:
+                st = os.fstat(f.fileno())
+                blob = json.load(f)
+        except (IOError, OSError, ValueError):
+            return {}
+        self._attrs_blob = blob
+        self._attrs_blob_mtime = (st.st_mtime, st.st_size)
+        return blob
+
+    @contextlib.contextmanager
+    def snapshot_reads(self, guild_names=None, attr_names=None):
+        """Serves reads of this run from one look at its .guild dir for the
+        duration: the names in `.guild` and `.guild/attrs` (listed here unless
+        given) answer which markers and per-attr files exist, and attrs.json
+        is loaded once.
+
+        Reading a run attr by attr otherwise tries to open a per-attr file
+        and re-stats attrs.json for each attr, and checks each status marker
+        with its own stat - a filesystem round-trip apiece. For a
+        point-in-time read of a whole run (building its index row) that is
+        most of the cost, and none of it is needed.
+        """
+        if guild_names is None:
+            guild_names = util.safe_listdir(self._guild_dir)
+        if attr_names is None:
+            attr_names = (
+                util.safe_listdir(self._attrs_dir()) if "attrs" in guild_names else ()
+            )
+        prev = self._snapshot
+        self._snapshot = (frozenset(guild_names), frozenset(attr_names))
+        try:
+            with self.pinned_attrs():
+                yield self
+        finally:
+            self._snapshot = prev
 
     @contextlib.contextmanager
     def pinned_attrs(self):

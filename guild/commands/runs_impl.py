@@ -1656,7 +1656,7 @@ def _restage_runs_parallel(runs, jobs):
             err=True,
         )
         failed.append(run)
-    parallel_stager._resync_index()
+    parallel_stager._resync_index(jobs)
     return failed
 
 
