@@ -799,7 +799,9 @@ def _delete_runs(args, ctx):
                 raise SystemExit(exit_code.ABORTED)
         for run in stoppable:
             _stop_run(run, no_wait=True)
-        var.delete_runs(selected, args.permanent)
+        var.delete_runs(
+            selected, args.permanent, jobs=getattr(args, "jobs", 1) or 1, progress=True
+        )
         if args.permanent:
             cli.out(f"Permanently deleted {len(selected)} run(s)", err=True)
         else:
@@ -831,7 +833,7 @@ def _purge_runs(args, ctx):
     no_runs_help = "Nothing to purge."
 
     def purge(selected):
-        var.purge_runs(selected)
+        var.purge_runs(selected, jobs=getattr(args, "jobs", 1) or 1, progress=True)
         cli.out(f"Permanently deleted {len(selected)} run(s)", err=True)
 
     runs_op(args.copy(deleted=True), ctx, preview, confirm, no_runs_help, purge)

@@ -74,6 +74,15 @@ measurable speedups on local disks.
   hash, the Guild home, `guild_patch.py`, path-valued flags). On a
   41k-file project staging a 35-file source code snapshot, this took a staged
   run from ~4,180 path syscalls and 4 subprocesses to ~78 and none.
+- Deletes runs with far fewer filesystem operations. A soft delete
+  (`guild runs delete`) moves each run with a single `rename` and copies its
+  existing index row into the trash index, instead of re-reading every moved
+  run from disk (and instead of an empty trash index rebuilding itself from
+  the runs just moved into it): ~66 -> ~4 runs-dir syscalls per run.
+  `--permanent` and `guild runs purge` remove run dirs without stat-ing every
+  entry (types come from the directory listing; symlinks are removed, never
+  followed), and take `-j N` to remove N runs in parallel - worthwhile on a
+  networked filesystem, where every file delete is a round-trip.
 - Ships the cluster staging/running tools (`guild-parallel-stager`,
   `guild-slurm-runner`) in-tree under `guild.cluster` (see below).
 
@@ -348,6 +357,11 @@ so they ship and version with this fork:
   `GUILD_STATIC_PROJECT=1`, so each worker selects and reads the project's
   source code files once rather than per trial; don't edit the project while
   a staging batch is running (runs staged after the edit may not pick it up).
+- **`guild-parallel-delete`** — `guild runs delete` with parallel jobs: takes
+  the same runs, filters, `--permanent` and `--yes`, and `--purge` to purge
+  the trash instead (`guild runs purge`). Runs `-j N` jobs, one per CPU unless
+  given; jobs only matter when files are actually deleted (`--permanent` or
+  `--purge`), since a soft delete just renames each run into the trash.
 - **`guild-slurm-runner`** — selects staged runs (by filter, ids, or a
   JSON file) and either executes them directly (`--exec`) or submits them to
   SLURM (`--sbatch`). Three submission shapes: the default writes one

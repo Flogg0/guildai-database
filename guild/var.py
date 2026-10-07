@@ -20,6 +20,7 @@ import logging
 import os
 import shutil
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
@@ -699,6 +700,8 @@ def _flush_pending_writes(root=None):
                 continue
             if changes.get('_register'):
                 _index_upsert_run(conn, changes['_run'])
+            if changes.get('_row'):
+                _index_insert_row(conn, changes['_row'])
             updates = {k: v for k, v in changes.items() if not k.startswith('_')}
             if updates:
                 set_clause = ", ".join(f"{col} = ?" for col in updates)
@@ -1105,6 +1108,32 @@ def index_register_run(run, root=None):
         _index_upsert_run(conn, run)
         conn.commit()
     _index_safe_write(_do, root, run_id=run.id)
+
+
+def index_put_row(row, root=None):
+    """Writes an index row taken from another index ({column: value}).
+
+    For a run whose row is already known, e.g. one moved between the runs
+    dir and trash: index_register_run would re-read it from disk.
+    """
+    pending = getattr(_index_local, 'pending_writes', None)
+    if pending is not None:
+        pending[row["run_id"]] = {'_row': row}
+        return
+    def _do():
+        conn = _get_index_conn(root)
+        _index_insert_row(conn, row)
+        conn.commit()
+    _index_safe_write(_do, root, run_id=row["run_id"])
+
+
+def _index_insert_row(conn, row):
+    cols = list(row)
+    conn.execute(
+        f"INSERT OR REPLACE INTO runs ({', '.join(cols)}) "
+        f"VALUES ({', '.join('?' for _ in cols)})",
+        [row[col] for col in cols],
+    )
 
 
 def index_remove_run(run_id, root=None):
@@ -1671,34 +1700,87 @@ def _run_attr(run, name):
     return run.get(name)
 
 
-def delete_runs(runs, permanent=False):
-    to_remove = []
+def delete_runs(runs, permanent=False, jobs=1, progress=False):
+    """Deletes runs, moving them to trash unless permanent.
+
+    `jobs` > 1 removes run dirs on that many threads (permanent only). Each
+    file in a run dir is its own delete; on a networked filesystem that is a
+    round-trip apiece, which threads overlap. `progress` shows a progress bar
+    on a terminal.
+    """
+    to_remove = [run.id for run in runs]
     to_register = []  # (run_id, dest) for soft-delete trash index
-    for run in runs:
-        src = run.dir
-        if permanent:
-            _delete_run(src)
-            to_remove.append(run.id)
-        else:
-            dest = os.path.join(runs_dir(deleted=True), run.id)
-            _move(src, dest)
-            to_remove.append(run.id)
+    if permanent:
+        _delete_run_dirs([run.dir for run in runs], jobs, progress)
+    else:
+        trash_root = runs_dir(deleted=True)
+        # The rows the index already holds for these runs describe them
+        # exactly; the trash index takes them as they are rather than
+        # re-reading every moved run from disk.
+        rows = _current_index_rows(runs_dir(), to_remove)
+        util.ensure_dir(trash_root)
+        # Open the trash index while the trash dir still matches it. Opened
+        # after the moves, an empty trash index (e.g. after a purge) sees run
+        # dirs it has no rows for and rebuilds itself from disk - reading
+        # every run just moved, the work the copied rows above avoid.
+        try:
+            _get_index_conn(trash_root)
+        except sqlite3.Error:
+            pass
+        for run in _progress(runs, len(runs), progress):
+            dest = os.path.join(trash_root, run.id)
+            _move(run.dir, dest, dest_dir_ensured=True)
             to_register.append((run.id, dest))
     with index_batch_writes():
         for run_id in to_remove:
             index_remove_run(run_id)
     if to_register:
-        trash_root = runs_dir(deleted=True)
         with index_batch_writes(root=trash_root):
             for run_id, dest in to_register:
-                index_register_run(runlib.Run(run_id, dest), root=trash_root)
+                row = rows.get(run_id)
+                if row is not None:
+                    index_put_row(row, root=trash_root)
+                else:
+                    index_register_run(runlib.Run(run_id, dest), root=trash_root)
 
 
-def purge_runs(runs):
-    to_remove_from_trash = []
-    for run in runs:
-        _delete_run(run.dir)
-        to_remove_from_trash.append(run.id)
+def _current_index_rows(root, run_ids):
+    """Returns {run_id: {column: value}} for the runs among run_ids whose
+    index row in root is current.
+
+    A run with a pending dirty marker (or any run, when a full resync is
+    pending) is left out: its row may lag the run dir.
+    """
+    if not run_ids or _dirty_marker_mtime(root) is not None:
+        return {}
+    dirty = {run_id for run_id, _mtime in _list_dirty_run_markers(root)}
+    wanted = [run_id for run_id in run_ids if run_id not in dirty]
+    rows = {}
+    try:
+        conn = _get_index_conn(root)
+        for i in range(0, len(wanted), 500):
+            chunk = wanted[i:i + 500]
+            placeholders = ", ".join("?" for _ in chunk)
+            cur = conn.execute(
+                f"SELECT * FROM runs WHERE run_id IN ({placeholders})", chunk
+            )
+            cols = [d[0] for d in cur.description]
+            for values in cur:
+                row = dict(zip(cols, values))
+                # Records the source index's own marker bookkeeping, which
+                # means nothing to another index.
+                row.pop("dirty_synced_mtime", None)
+                rows[row["run_id"]] = row
+    except sqlite3.Error:
+        return {}
+    return rows
+
+
+def purge_runs(runs, jobs=1, progress=False):
+    """Permanently deletes runs from trash. See delete_runs for `jobs` and
+    `progress`."""
+    to_remove_from_trash = [run.id for run in runs]
+    _delete_run_dirs([run.dir for run in runs], jobs, progress)
     # Drop the purged runs from the trash index, mirroring restore_runs. Without
     # this the trash index keeps listing runs whose dirs are gone, so every
     # later trash op (purge/list --deleted/restore) re-reads and re-syncs a
@@ -1710,10 +1792,60 @@ def purge_runs(runs):
                 index_remove_run(run_id, trash_root)
 
 
+def _delete_run_dirs(dirs, jobs=1, progress=False):
+    if jobs > 1 and len(dirs) > 1:
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(min(jobs, len(dirs))) as pool:
+            # list() so an error from any run dir is raised here.
+            list(_progress(pool.map(_delete_run, dirs), len(dirs), progress))
+    else:
+        for src in _progress(dirs, len(dirs), progress):
+            _delete_run(src)
+
+
+def _progress(iterable, total, enabled):
+    """Wraps iterable in a tqdm progress bar if enabled and tqdm is installed.
+
+    tqdm is not one of Guild's own dependencies. The bar is only shown when
+    stderr is a terminal, so piped and captured output is unchanged (tqdm's
+    own disable=None check misses stream objects without an isatty()).
+    """
+    if not enabled or not _stderr_isatty():
+        return iterable
+    try:
+        import tqdm
+    except ImportError:
+        return iterable
+    return tqdm.tqdm(iterable, total=total)
+
+
+def _stderr_isatty():
+    try:
+        return sys.stderr.isatty()
+    except (AttributeError, ValueError):
+        return False
+
+
 def _delete_run(src):
     assert src and src != os.path.sep, src
     assert src.startswith(runs_dir()) or src.startswith(runs_dir(deleted=True)), src
     log.debug("deleting %s", src)
+    if _can_remove_tree_fd():
+        try:
+            fd = os.open(src, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return
+        except OSError:
+            # Not a plain directory (e.g. a symlink): shutil decides, as before.
+            fd = None
+        if fd is not None:
+            try:
+                _remove_tree_fd(fd)
+            finally:
+                os.close(fd)
+            _ignore_missing(os.rmdir, src)
+            return
     def _on_error(func, path, exc_info):
         if isinstance(exc_info[1], FileNotFoundError):
             return
@@ -1721,9 +1853,64 @@ def _delete_run(src):
     shutil.rmtree(src, onerror=_on_error)
 
 
-def _move(src, dest):
-    util.ensure_dir(os.path.dirname(dest))
+def _can_remove_tree_fd():
+    return (
+        os.scandir in os.supports_fd
+        and os.open in os.supports_dir_fd
+        and os.unlink in os.supports_dir_fd
+        and os.rmdir in os.supports_dir_fd
+    )
+
+
+def _remove_tree_fd(dir_fd):
+    """Removes everything in the directory open as dir_fd.
+
+    Like shutil.rmtree, works relative to directory fds and never follows a
+    symlink (one is removed as an entry). Unlike it, an entry's type comes
+    from the directory listing instead of a stat of every entry, which on a
+    networked filesystem is a round-trip apiece. Entries that vanish in the
+    meantime are skipped; any other error is raised.
+    """
+    with os.scandir(dir_fd) as it:
+        entries = list(it)
+    for entry in entries:
+        if entry.is_dir(follow_symlinks=False):
+            try:
+                fd = os.open(
+                    entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW,
+                    dir_fd=dir_fd,
+                )
+            except FileNotFoundError:
+                continue
+            try:
+                _remove_tree_fd(fd)
+            finally:
+                os.close(fd)
+            _ignore_missing(os.rmdir, entry.name, dir_fd=dir_fd)
+        else:
+            _ignore_missing(os.unlink, entry.name, dir_fd=dir_fd)
+
+
+def _ignore_missing(f, *args, **kw):
+    try:
+        f(*args, **kw)
+    except FileNotFoundError:
+        pass
+
+
+def _move(src, dest, dest_dir_ensured=False):
+    if not dest_dir_ensured:
+        util.ensure_dir(os.path.dirname(dest))
     log.debug("moving %s to %s", src, dest)
+    # The common case is a rename on one filesystem to a name that doesn't
+    # exist yet: one call, without first checking dest and then having
+    # shutil.move check it again. Anything rename can't do (dest exists and
+    # isn't empty, another filesystem) takes the original path.
+    try:
+        os.rename(src, dest)
+        return
+    except OSError:
+        pass
     if os.path.exists(dest):
         _move_to_backup(dest)
     shutil.move(src, dest)
