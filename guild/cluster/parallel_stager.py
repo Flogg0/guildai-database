@@ -1,11 +1,13 @@
 import argparse
 import contextlib
 import io
+import multiprocessing
 import os
 import shlex
 import subprocess
 import sys
 import tempfile
+import threading
 
 import joblib
 from guild.cluster.helpers import yesno
@@ -20,11 +22,14 @@ def create_trial_args(args):
     print(f"Detected operation: {operation}")
 
     with tempfile.NamedTemporaryFile() as ntf:
-        command = ["guild", "run", f"--save-trials={ntf.name}"] + args
-        # command = ["guild", "run"] + args
-        command = " ".join(command)
-        print(repr(command))
-        subprocess.check_call(command, shell=True)
+        argv = ["run", f"--save-trials={ntf.name}"] + args
+        print(repr(" ".join(["guild"] + argv)))
+        # In this process rather than a `guild` subprocess: a subprocess is
+        # one more cold start (Python and guild imported over what is often
+        # a networked install), and doing it here leaves guild imported and
+        # the op resolved for the forked staging workers to inherit.
+        _set_staging_env()
+        _run_guild(argv)
         import pandas as pd
 
         result = pd.read_csv(ntf.name)
@@ -52,6 +57,21 @@ def _stage_in_process(command):
     skips that startup. Behaviour is unchanged: same argv, same exit
     semantics (a non-zero guild exit raises, like subprocess.check_call).
     """
+    _set_staging_env()
+    argv = shlex.split(command)
+    if argv and argv[0] == "guild":
+        argv = argv[1:]
+    buf = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
+            _run_guild(argv, command)
+    except BaseException:
+        sys.stderr.write(buf.getvalue())
+        raise
+    return command
+
+
+def _set_staging_env():
     # Staging is a bulk pre-step: skip the per-trial SQLite index write (a
     # journaled transaction on one shared NFS file that every worker contends
     # on). In writes-disabled mode guild drops a per-run dirty marker instead;
@@ -61,38 +81,69 @@ def _stage_in_process(command):
     # and read its source code files once per worker instead of once per
     # trial (a walk of the whole project tree and a read of each file).
     os.environ["GUILD_STATIC_PROJECT"] = "1"
+
+
+def _run_guild(argv, command=None):
+    """Runs a guild command in this process, raising CalledProcessError on a
+    non-zero exit like subprocess.check_call."""
     from guild.commands.main import main as guild_cli
 
-    argv = shlex.split(command)
-    if argv and argv[0] == "guild":
-        argv = argv[1:]
-    buf = io.StringIO()
     try:
-        with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(buf):
-            # standalone_mode=False -> return instead of sys.exit on success,
-            # and raise (not exit) on error, so failures surface to joblib.
-            guild_cli.main(args=argv, standalone_mode=False)
+        # standalone_mode=False -> return instead of sys.exit on success,
+        # and raise (not exit) on error, so failures surface to the caller.
+        guild_cli.main(args=argv, standalone_mode=False)
     except SystemExit as e:
         code = e.code if isinstance(e.code, int) else (0 if e.code is None else 1)
         if code != 0:
-            sys.stderr.write(buf.getvalue())
-            raise subprocess.CalledProcessError(code, command)
-    except BaseException:
-        sys.stderr.write(buf.getvalue())
-        raise
-    return command
+            raise subprocess.CalledProcessError(code, command or " ".join(argv))
 
 
 def parallel_stage_trials(trial_commands, n_jobs=None):
+    return _run_parallel(_stage_in_process, trial_commands, n_jobs)
+
+
+def _run_parallel(f, commands, n_jobs):
+    """Applies f to each command across worker processes, returning the
+    results in order.
+
+    Workers are forked from this process where that is safe, so they start
+    with guild already imported and the op already resolved. Spawned workers
+    (joblib's loky) each start a fresh interpreter and import everything
+    again, a cold start per worker that over a networked install takes tens
+    of seconds. GUILD_STAGER_BACKEND=loky forces spawned workers.
+    """
     if n_jobs is None:
         n_jobs = joblib.cpu_count()
+    if _can_fork():
+        n_jobs = joblib.effective_n_jobs(n_jobs)
+        # An SQLite connection must not cross a fork; workers open their own.
+        _close_index_conns()
+        with multiprocessing.get_context("fork").Pool(n_jobs) as pool:
+            return list(
+                _maybe_progress(pool.imap(f, commands, chunksize=1), len(commands))
+            )
+    jobs = [joblib.delayed(f)(command) for command in commands]
+    return joblib.Parallel(n_jobs=n_jobs)(_maybe_progress(jobs))
 
-    jobs = [joblib.delayed(_stage_in_process)(command) for command in trial_commands]
-    result = joblib.Parallel(n_jobs=n_jobs)(_maybe_progress(jobs))
-    return result
+
+def _can_fork():
+    if os.getenv("GUILD_STAGER_BACKEND", "fork") != "fork":
+        return False
+    if "fork" not in multiprocessing.get_all_start_methods():
+        return False
+    # A child forked while another thread runs inherits whatever locks that
+    # thread held; only fork from a single-threaded process.
+    return threading.active_count() == 1
 
 
-def _maybe_progress(jobs):
+def _close_index_conns():
+    from guild import var
+
+    for key in [k for k in vars(var._index_local) if k.startswith("conn_")]:
+        var._drop_cached_conn(key)
+
+
+def _maybe_progress(jobs, total=None):
     """Wrap jobs in a tqdm progress bar when tqdm is installed.
 
     tqdm is not a hard requirement of Guild itself, and this module is now
@@ -103,7 +154,7 @@ def _maybe_progress(jobs):
         import tqdm
     except ImportError:
         return jobs
-    return tqdm.tqdm(jobs)
+    return tqdm.tqdm(jobs, total=total)
 
 
 def _stage_in_process_result(command):
@@ -124,10 +175,7 @@ def parallel_stage_commands(commands, n_jobs=None):
     """Runs `guild` staging commands across workers, returning
     [(command, error_or_None)] without aborting the batch on a failure.
     """
-    if n_jobs is None:
-        n_jobs = joblib.cpu_count()
-    jobs = [joblib.delayed(_stage_in_process_result)(cmd) for cmd in commands]
-    return joblib.Parallel(n_jobs=n_jobs)(_maybe_progress(jobs))
+    return _run_parallel(_stage_in_process_result, commands, n_jobs)
 
 
 def _precompute_vcs_commit():

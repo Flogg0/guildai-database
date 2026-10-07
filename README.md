@@ -335,7 +335,13 @@ so they ship and version with this fork:
   stages them. It stages **in-process** (reusing one imported `guild` per
   worker) instead of forking a fresh `guild` process per trial, which
   avoids re-paying Python import + charset-detection startup on every
-  trial; for large batches this is the dominant local cost. It stages in
+  trial; for large batches this is the dominant local cost. The trial grid
+  is expanded in the stager's own process (no `guild run --save-trials`
+  subprocess), and on Linux the workers are **forked** from it, so they
+  start with guild imported and the op resolved instead of each cold-starting
+  a fresh interpreter (joblib's loky) and importing everything again over a
+  networked install. `GUILD_STAGER_BACKEND=loky` restores spawned workers;
+  forking is also skipped if the process has other threads running. It stages in
   **worker mode automatically** — it sets `GUILD_NO_INDEX_WRITES=1` for its
   workers so per-trial index writes become per-run dirty markers, then
   resyncs the index once after all trials are staged. It also sets
