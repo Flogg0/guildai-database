@@ -14,6 +14,7 @@
 
 import logging
 import os
+import stat
 
 from guild import cli
 from guild import config
@@ -88,9 +89,12 @@ def _maybe_apply_cwd(args):
 
 def _validated_dir(path):
     path = os.path.expanduser(path)
-    if not os.path.exists(path):
+    # One stat answers both checks (exists() and isdir() would stat twice).
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
         cli.error(f"directory '{path}' does not exist")
-    if not os.path.isdir(path):
+    if not stat.S_ISDIR(st.st_mode):
         cli.error(f"'{path}' is not a directory")
     return path
 

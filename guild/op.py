@@ -146,12 +146,17 @@ def stage(op, continue_on_deps_error=False):
     from guild import var
     with var.index_batch_writes():
         run = init_run(op)
+        staged = False
         try:
             _stage_run_proc_env(op, run)
             _resolve_deps(op, run, for_stage=True, continue_on_error=continue_on_deps_error)
             op_util.set_run_staged(run)
+            staged = True
         finally:
-            op_util.clear_run_pending(run)
+            # set_run_staged clears PENDING itself; clearing it again would be
+            # one more delete of a file that is already gone.
+            if not staged:
+                op_util.clear_run_pending(run)
     return run
 
 

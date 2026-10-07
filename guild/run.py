@@ -129,6 +129,12 @@ class Run:
         self._attrs_blob = None
         self._attrs_blob_mtime = None
         self._attrs_blob_pinned = False
+        # Set by init_skel: True when it created the run dir, i.e. the run is
+        # new and nothing from a previous run cycle can be on disk.
+        self._dir_created = False
+        # Set when a new run's source code is copied: the copied bytes keyed
+        # by manifest path, for computing its digest without reading back.
+        self._sourcecode_contents = None
         self._props = util.PropertyCache(
             [
                 ("timestamp", None, self._get_timestamp, 1.0),
@@ -516,11 +522,16 @@ class Run:
         return f"<{self.__class__.__module__}.{self.__class__.__name__} '{self.id}'>"
 
     def init_skel(self):
+        # Create the run dir level by level: on a new run each mkdir succeeds
+        # first time, and whether the run dir itself was created says the run
+        # is new, so checks for leftovers from a previous cycle can be skipped.
+        self._dir_created = util.ensure_dir_created(self.path)
+        util.ensure_dir(self._guild_dir)
         util.ensure_dir(self.guild_path("attrs"))
-        # `.guild` now exists (ensure_dir created attrs under it); let later
-        # marker writes skip their redundant ensure_dir on this run object.
+        # `.guild` now exists; let later marker writes skip their redundant
+        # ensure_dir on this run object.
         self._guild_dir_ensured = True
-        if not self.has_attr("initialized"):
+        if self._dir_created or not self.has_attr("initialized"):
             self.write_attr("id", self.id)
             self.write_attr("initialized", timestamp())
         else:

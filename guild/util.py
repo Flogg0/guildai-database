@@ -88,12 +88,67 @@ def pop_find(l, f, default=None):
 
 
 def ensure_dir(d):
+    """Creates directory `d`, and any missing parents, if it doesn't exist."""
+    ensure_dir_created(d)
+
+
+def ensure_dir_created(d):
+    """Like `ensure_dir` but returns True if `d` was created by this call,
+    False if it already existed.
+    """
+    # Try a plain mkdir first. When the parent exists - nearly always - that
+    # one call both creates the dir and answers "already there". Resolving
+    # the path first lstats every component and makedirs stats each parent,
+    # a round-trip apiece on a network filesystem, so that path is kept for
+    # what mkdir can't settle: '.'/'..' components, and paths that exist but
+    # are not directories (e.g. a dangling symlink).
+    parent, name = os.path.split(d.rstrip(os.path.sep))
+    if _plain_dir_name(parent, name):
+        try:
+            os.mkdir(d)
+            return True
+        except FileNotFoundError:
+            if parent:
+                ensure_dir_created(parent)
+                created = _mkdir_or_existing(d)
+                if created is not None:
+                    return created
+        except FileExistsError:
+            if os.path.isdir(d):
+                return False
+        except OSError:
+            pass
+    return _ensure_dir_resolved(d)
+
+
+def _plain_dir_name(parent, name):
+    if not name or name in (os.curdir, os.pardir):
+        return False
+    if os.path.altsep:
+        parent = parent.replace(os.path.altsep, os.path.sep)
+    return os.pardir not in parent.split(os.path.sep)
+
+
+def _mkdir_or_existing(d):
+    """mkdir d: True if created, False if already a dir, None if neither."""
+    try:
+        os.mkdir(d)
+        return True
+    except FileExistsError:
+        return False if os.path.isdir(d) else None
+    except OSError:
+        return None
+
+
+def _ensure_dir_resolved(d):
     d = realpath(d)
     try:
         os.makedirs(d)
     except OSError as e:
         if e.errno != errno.EEXIST:
             raise
+        return False
+    return True
 
 
 def ensure_deleted(path):
@@ -1306,15 +1361,24 @@ def platform_info():
     return info
 
 
-def _platform_base_info():
-    import platform
+_platform_base_info_cache = None
 
-    return {
-        "architecture": " ".join(platform.architecture()),
-        "processor": platform.processor(),
-        "python_version": sys.version.replace("\n", ""),
-        "uname": " ".join(platform.uname()),
-    }
+
+def _platform_base_info():
+    # Fixed for the life of the process, and platform.architecture() runs
+    # `file` on the Python executable to get it. Callers that init many runs
+    # in one process (batch stagers) would otherwise spawn it once per run.
+    global _platform_base_info_cache
+    if _platform_base_info_cache is None:
+        import platform
+
+        _platform_base_info_cache = {
+            "architecture": " ".join(platform.architecture()),
+            "processor": platform.processor(),
+            "python_version": sys.version.replace("\n", ""),
+            "uname": " ".join(platform.uname()),
+        }
+    return dict(_platform_base_info_cache)
 
 
 def _platform_psutil_info():
@@ -1418,6 +1482,17 @@ def short_digest(s):
     return s[:8]
 
 
+def static_project():
+    """Returns True if the project dir is declared unchanging for this process.
+
+    Batch stagers that init many runs from one project in a single process
+    set GUILD_STATIC_PROJECT=1 so that what is read from the project - which
+    source code files to copy and their contents - is read once per process
+    rather than once per run.
+    """
+    return os.getenv("GUILD_STATIC_PROJECT") == "1"
+
+
 def safe_listdir(path):
     try:
         return os.listdir(path)
@@ -1426,6 +1501,10 @@ def safe_listdir(path):
 
 
 def compare_paths(p1, p2):
+    # The same path string names the same file. Resolving would lstat every
+    # component of both paths only to arrive at that answer.
+    if p1 == p2:
+        return True
     return _resolve_path(p1) == _resolve_path(p2)
 
 

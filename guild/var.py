@@ -173,9 +173,15 @@ def _touch_run_dirty_marker(root, run_id):
         _dirty_runs_dir_ensured.add(d)
     path = os.path.join(d, run_id)
     try:
-        with open(path, "a"):
-            pass
-        os.utime(path, None)
+        # A marker created here already has a fresh mtime; only an existing
+        # one needs bringing forward. (Opening it for append and then setting
+        # the time is two round-trips on NFS for the common, new-file case.)
+        try:
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+        except FileExistsError:
+            os.utime(path, None)
+        else:
+            os.close(fd)
     except OSError as e:
         log.debug("Failed to touch per-run dirty marker at %s: %s", path, e)
 

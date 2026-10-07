@@ -59,6 +59,19 @@ measurable speedups on local disks.
   networked filesystem). The parallel stager computes it once and passes it to
   every trial via `GUILD_VCS_COMMIT`; `write_vcs_commit` uses that value
   instead of re-running git. (`NO_VCS_COMMIT=1` still skips it entirely.)
+- Copies a run's source code with one read and one write per file: no
+  `realpath` walk per file, no shutil stat/chmod round-trips (the mode is set
+  only if the umask didn't already give it), and the manifest hashes and the
+  `sourcecode_digest` are computed from the bytes just copied instead of
+  reading every copy back out of the run dir. Creating a new run's dirs, and
+  the checks for leftovers of a previous run cycle that a new run can't have,
+  are likewise cut to the minimum.
+- With `GUILD_STATIC_PROJECT=1` (set by `guild-parallel-stager`), the project
+  is treated as unchanging for the life of the process: which source code
+  files to copy - a walk of the whole project tree plus `git ls-files` - and
+  their contents are read once per process, not once per staged run. On a
+  41k-file project staging a 35-file source code snapshot, this took a staged
+  run from ~4,180 path syscalls and 4 subprocesses to ~78 and none.
 - Ships the cluster staging/running tools (`guild-parallel-stager`,
   `guild-slurm-runner`) in-tree under `guild.cluster` (see below).
 
@@ -323,7 +336,10 @@ so they ship and version with this fork:
   trial; for large batches this is the dominant local cost. It stages in
   **worker mode automatically** — it sets `GUILD_NO_INDEX_WRITES=1` for its
   workers so per-trial index writes become per-run dirty markers, then
-  resyncs the index once after all trials are staged.
+  resyncs the index once after all trials are staged. It also sets
+  `GUILD_STATIC_PROJECT=1`, so each worker selects and reads the project's
+  source code files once rather than per trial; don't edit the project while
+  a staging batch is running (runs staged after the edit may not pick it up).
 - **`guild-slurm-runner`** — selects staged runs (by filter, ids, or a
   JSON file) and either executes them directly (`--exec`) or submits them to
   SLURM (`--sbatch`). Three submission shapes: the default writes one

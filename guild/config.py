@@ -406,12 +406,27 @@ def _guild_python_exe():
     return os.getenv("GUILD_PYTHON_EXE")
 
 
+_virtualenv_python_exe_cache = {}
+
+
 def _virtualenv_python_exe():
+    # Resolving this stats the env's python and spawns `which`. Batch stagers
+    # resolve it twice per run, so remember what was found for the
+    # environment it was found in. Only a found exe is kept: an env's python
+    # can appear later in the process, but is not expected to vanish.
+    key = (_virtual_env_prefix(), os.getenv("PATH"))
+    try:
+        return _virtualenv_python_exe_cache[key]
+    except KeyError:
+        pass
     if not _virtual_env_activated():
         return None
     from guild import util  # See import note above
 
-    return util.which("python")
+    exe = util.which("python")
+    if exe:
+        _virtualenv_python_exe_cache[key] = exe
+    return exe
 
 
 def _virtual_env_activated():
