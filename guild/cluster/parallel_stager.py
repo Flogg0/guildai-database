@@ -57,6 +57,10 @@ def _stage_in_process(command):
     # on). In writes-disabled mode guild drops a per-run dirty marker instead;
     # _resync_index() folds them into the index once after staging.
     os.environ["GUILD_NO_INDEX_WRITES"] = "1"
+    # Every trial stages from the same, unchanging project: let guild select
+    # and read its source code files once per worker instead of once per
+    # trial (a walk of the whole project tree and a read of each file).
+    os.environ["GUILD_STATIC_PROJECT"] = "1"
     from guild.commands.main import main as guild_cli
 
     argv = shlex.split(command)

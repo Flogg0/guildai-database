@@ -312,8 +312,33 @@ class FileCopyHandler:
         src = os.path.join(self.src_root, path)
         dest = os.path.join(self.dest_root, path)
         log.debug("copying %s to %s", src, dest)
-        util.ensure_dir(os.path.dirname(dest))
+        self._ensure_dest_dir(os.path.dirname(dest))
         self._try_copy_file(src, dest)
+
+    def _ensure_dest_dir(self, dest_dir):
+        # Ensure each dest dir once per copy rather than once per file, and
+        # remember which ones this copy created (see is_new_dir).
+        ensured = self.__dict__.setdefault("_ensured_dirs", {})
+        if dest_dir in ensured:
+            return
+        missing = [dest_dir]
+        while True:
+            parent = os.path.dirname(missing[-1])
+            if parent in ensured or parent == missing[-1]:
+                break
+            missing.append(parent)
+        if ensured.get(parent):
+            # Below a dir this copy created nothing exists yet, so create the
+            # missing levels top-down - one mkdir each - rather than have
+            # ensure_dir find the missing parents by failing on the way up.
+            for d in reversed(missing):
+                ensured[d] = util.ensure_dir_created(d)
+        else:
+            ensured[dest_dir] = util.ensure_dir_created(dest_dir)
+
+    def is_new_dir(self, dest_dir):
+        """True if this copy created dest_dir, so no file in it predates it."""
+        return self.__dict__.get("_ensured_dirs", {}).get(dest_dir, False)
 
     def _try_copy_file(self, src, dest):
         try:
@@ -391,20 +416,41 @@ def _copytree_impl(src, select, followlinks, ignore, copy_handler):
     if select.disabled:
         return
     ignore = set(ignore or [])
+    for selected, relpath, results in _copytree_events(src, select, followlinks, ignore):
+        if selected:
+            copy_handler.copy(relpath, results)
+        else:
+            copy_handler.ignore(relpath, results)
+
+
+def _copytree_events(src, select, followlinks, ignore):
+    if not util.static_project():
+        return _iter_copytree_events(src, select, followlinks, ignore)
+    # With the project declared unchanging, walk it and apply the select
+    # rules once per select and reuse the outcome. The walk stats and lists
+    # every project dir, which repeated per run dominates staging I/O. The
+    # outcome is kept on the select so it lives exactly as long as it does.
+    cache = select.__dict__.setdefault("_static_copytree_events", {})
+    key = (src, followlinks, frozenset(ignore))
+    try:
+        return cache[key]
+    except KeyError:
+        events = cache[key] = list(_iter_copytree_events(src, select, followlinks, ignore))
+        return events
+
+
+def _iter_copytree_events(src, select, followlinks, ignore):
+    """Yields (selected, relpath, results) for each path under src."""
     for root, dirs, files in os.walk(src, followlinks=followlinks):
         dirs.sort()
         relroot = _relpath(root, src)
         pruned = select.prune_dirs(src, relroot, dirs)
         for name in pruned:
-            relpath = os.path.join(relroot, name)
-            copy_handler.ignore(relpath, [])
+            yield False, os.path.join(relroot, name), []
         for name in sorted(files):
             relpath = os.path.join(relroot, name)
             selected, results = _select_file_to_copy(src, relpath, select, ignore)
-            if selected:
-                copy_handler.copy(relpath, results)
-            else:
-                copy_handler.ignore(relpath, results)
+            yield selected, relpath, results
 
 
 def _select_file_to_copy(src, relpath, select, ignore):
@@ -515,7 +561,12 @@ def files_differ(path1, path2):
     return False
 
 
-def files_digest(paths, root_dir):
+def files_digest(paths, root_dir, contents=None):
+    """Returns the digest of the files at paths under root_dir.
+
+    `contents`, if given, maps each path to the file's bytes, which are used
+    in place of reading the file.
+    """
     import hashlib
 
     md5 = hashlib.md5()
@@ -523,7 +574,10 @@ def files_digest(paths, root_dir):
         normpath = _path_for_digest(path)
         md5.update(_encode_file_path_for_digest(normpath))
         md5.update(b"\x00")
-        _apply_digest_file_bytes(os.path.join(root_dir, path), md5)
+        if contents is not None:
+            md5.update(contents[path])
+        else:
+            _apply_digest_file_bytes(os.path.join(root_dir, path), md5)
         md5.update(b"\x00")
     return md5.hexdigest()
 

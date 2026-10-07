@@ -1351,19 +1351,34 @@ def _on_dep_source_resolved(_op, resolved_source):
 
 
 def _on_run_initialized(op, run):
-    _init_run_manifest(run)
     # _copy_run_sourcecode skips the copy (and a redundant manifest open) when
     # sourcecode is disabled, but always write the digest: it goes into the
     # consolidated attrs.json (no extra file write in the default blob mode),
     # and batch optimizers with `prev-trials: sourcecode` hard-error if the
     # proto has no sourcecode_digest attr.
-    _copy_run_sourcecode(run, op)
+    if run._dir_created:
+        # A source code copy opens the manifest to log to it, which creates
+        # it on a new run; only create it here when nothing was copied.
+        copied = False
+        try:
+            copied = _copy_run_sourcecode(run, op)
+        finally:
+            if not copied:
+                _init_run_manifest(run)
+    else:
+        _init_run_manifest(run)
+        _copy_run_sourcecode(run, op)
     _write_run_sourcecode_digest(run)
     _write_run_vcs_commit(run, op)
 
 
 def _init_run_manifest(run):
-    util.touch(run.guild_path("manifest"))
+    if run._dir_created:
+        # Creating the file is enough on a new run: it can't already exist,
+        # so there's no older mtime to bring forward.
+        open(run.guild_path("manifest"), "ab").close()
+    else:
+        util.touch(run.guild_path("manifest"))
 
 
 def _copy_run_sourcecode(run, op):
@@ -1371,6 +1386,10 @@ def _copy_run_sourcecode(run, op):
     copied, False if there was nothing to copy (disabled or no rules)."""
     assert op._opdef
     opdef = op._opdef
+    # On a new run the manifest starts empty, so what this copy records is
+    # all of the run's source code: keep the bytes for the digest. Otherwise
+    # the digest is computed from the manifest as before.
+    contents = run._sourcecode_contents = {} if run._dir_created else None
     if os.getenv("NO_SOURCECODE") == "1":
         log.debug("NO_SOURCECODE=1, skipping sourcecode copy")
         return False
@@ -1400,7 +1419,9 @@ def _copy_run_sourcecode(run, op):
         sourcecode_select,
         dest,
         ignore=_ignored_sourcecode_paths(op),
-        handler_cls=op_util.sourcecode_manifest_logger_cls(run.dir),
+        handler_cls=op_util.sourcecode_manifest_logger_cls(
+            run.dir, contents, new_run=run._dir_created
+        ),
     )
     return True
 

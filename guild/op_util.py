@@ -33,11 +33,14 @@ notes" in `guild.guildfile` module source code for additional thougts.
 """
 
 import csv
+import errno
 import importlib
 import io
 import logging
 import os
 import re
+import shutil
+import stat
 import struct
 import sys
 import threading
@@ -660,7 +663,9 @@ def clear_run_marker(run, marker):
 
 def set_run_pending(run):
     set_run_marker(run, "PENDING")
-    clear_run_marker(run, "STAGED")
+    # A run dir created by this init can't hold a STAGED marker.
+    if not getattr(run, "_dir_created", False):
+        clear_run_marker(run, "STAGED")
     var.index_update_status(run, "pending")
 
 
@@ -669,7 +674,17 @@ def clear_run_pending(run):
 
 
 def write_sourcecode_digest(run):
-    digest = run_util.sourcecode_digest(run)
+    contents = getattr(run, "_sourcecode_contents", None)
+    if contents is not None and None not in contents.values():
+        # The source code was just copied into a new run and its bytes are in
+        # hand: digest those rather than re-reading the manifest and then
+        # every copied file back out of the run dir.
+        digest = (
+            file_util.files_digest(sorted(contents), run.dir, contents)
+            if contents else None
+        )
+    else:
+        digest = run_util.sourcecode_digest(run)
     run.write_attr("sourcecode_digest", digest)
 
 
@@ -892,7 +907,24 @@ def _rendered_str(s):
 ###################################################################
 
 
+_static_sourcecode_selects = {}
+
+
 def sourcecode_select_for_opdef(opdef):
+    if not util.static_project():
+        return _sourcecode_select_for_opdef(opdef)
+    # Building the select runs `git ls-files` and stats the project. With the
+    # project declared unchanging, build it once per op per process and reuse
+    # it, which also lets copytree reuse the files it selected.
+    key = (opdef.guildfile.src, opdef.modeldef.name, opdef.name)
+    try:
+        return _static_sourcecode_selects[key]
+    except KeyError:
+        select = _static_sourcecode_selects[key] = _sourcecode_select_for_opdef(opdef)
+        return select
+
+
+def _sourcecode_select_for_opdef(opdef):
     return _builtin_sourcecode_select_rules(opdef) or _project_sourcecode_select_rules(
         opdef
     )
@@ -1055,6 +1087,10 @@ class SourceCodeCopyHandler(file_util.FileCopyHandler):
     """Handler to log warnings when soure code files are skipped.
 
     Only logs warnings when the default rules are in effect.
+
+    Copies each file with one read and one write, and returns the bytes it
+    copied from `_try_copy_file` so subclasses can hash them without reading
+    the copy back.
     """
 
     _warned_max_matches = False
@@ -1063,6 +1099,15 @@ class SourceCodeCopyHandler(file_util.FileCopyHandler):
         " To control which files are copied, define 'sourcecode' "
         "for the operation in a Guild file."
     )
+
+    def _try_copy_file(self, src, dest):
+        try:
+            return _copy_sourcecode_file(src, dest, self.is_new_dir(os.path.dirname(dest)))
+        except OSError as e:
+            if e.errno != errno.ENOENT:  # Ignore file not exists
+                if not self.handle_copy_error(e, src, dest):
+                    raise
+            return None
 
     def ignore(self, path, rule_results):
         fullpath = os.path.join(self.src_root, path)
@@ -1101,6 +1146,83 @@ class SourceCodeCopyHandler(file_util.FileCopyHandler):
             os.path.relpath(fullpath),
             self._warning_help_suffix,
         )
+
+
+# Source files larger than this are copied the generic way and not held in
+# memory - neither in the static-project cache nor for the run's digest.
+_MAX_IN_MEMORY_SOURCECODE_FILE = 16 * 1024 * 1024
+
+_static_sourcecode_files = {}
+
+_new_file_mode = None
+
+
+def _copy_sourcecode_file(src, dest, dest_is_new):
+    """Copies src to dest like shutil.copyfile + copymode.
+
+    Returns the bytes copied, or None if the file was copied the generic way
+    (not a regular file, or too big to hold in memory).
+
+    shutil stats src and dest twice each and then chmods dest. Here src is
+    opened and read once, dest is created and written once, and the mode is
+    set only when the new file did not already get it from the umask.
+    `dest_is_new` says dest can't already exist (its dir was just created),
+    so its mode is the umask default.
+    """
+    data_mode = _read_sourcecode_file(src)
+    if data_mode is None:
+        shutil.copyfile(src, dest)
+        shutil.copymode(src, dest)
+        return None
+    data, mode = data_mode
+    # os-level calls: open() would also fstat the new file.
+    fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0), 0o666)
+    try:
+        view = memoryview(data)
+        while view:
+            view = view[os.write(fd, view):]
+    finally:
+        os.close(fd)
+    if not dest_is_new or mode != _default_new_file_mode():
+        os.chmod(dest, mode)
+    return data
+
+
+def _read_sourcecode_file(src):
+    """Returns (bytes, permission bits) for src, or None.
+
+    None when src is not a regular file (shutil raises for those, so the
+    caller defers to it) or is too big to hold. With a static project the
+    result is cached for the process.
+    """
+    static = util.static_project()
+    if static:
+        try:
+            return _static_sourcecode_files[src]
+        except KeyError:
+            pass
+    # O_NONBLOCK so a FIFO is not blocked on: it is detected below and left
+    # to shutil, which raises for it. No effect on regular files.
+    fd = os.open(src, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > _MAX_IN_MEMORY_SOURCECODE_FILE:
+            return None
+        result = f.read(), stat.S_IMODE(st.st_mode)
+    if static:
+        _static_sourcecode_files[src] = result
+    return result
+
+
+def _default_new_file_mode():
+    # Mode open() gives a new file. Reading the umask means setting it, so
+    # do that once per process.
+    global _new_file_mode
+    if _new_file_mode is None:
+        umask = os.umask(0o22)
+        os.umask(umask)
+        _new_file_mode = 0o666 & ~umask
+    return _new_file_mode
 
 
 ###################################################################
@@ -1980,13 +2102,32 @@ def handle_system_exit(e):
     main.handle_system_exit(e)
 
 
-def sourcecode_manifest_logger_cls(run_dir):
+def sourcecode_manifest_logger_cls(run_dir, contents=None, new_run=False):
+    """Returns a copy handler class that logs copied files to the manifest.
+
+    If `contents` is a dict, the bytes of each copied file are recorded in it
+    under the file's manifest path (None for a file copied without them), so
+    the run's source code digest can be computed without reading them back.
+
+    `new_run` says run_dir was just created and holds nothing but `.guild`,
+    so a copy into it needs neither ensure it exists nor check for files a
+    copied one would replace.
+    """
     m = run_manifest.manifest_for_run(run_dir, "a")
 
     class Handler(SourceCodeCopyHandler):
+        def __init__(self, src_root, dest_root, select):
+            super().__init__(src_root, dest_root, select)
+            if new_run and os.path.normpath(dest_root) == os.path.normpath(run_dir):
+                # Keyed the way copy() derives a top-level file's dir.
+                self._ensured_dirs = {os.path.dirname(os.path.join(dest_root, "_")): True}
+
         def _try_copy_file(self, src, dest):
-            super()._try_copy_file(src, dest)
-            m.write(run_manifest.sourcecode_args(dest, run_dir, src, self.src_root))
+            data = super()._try_copy_file(src, dest)
+            args = run_manifest.sourcecode_args(dest, run_dir, src, self.src_root, data)
+            m.write(args)
+            if contents is not None:
+                contents[args[1]] = data
 
         def close(self):
             m.close()

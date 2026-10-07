@@ -20,16 +20,23 @@ from guild import util
 from guild import var
 
 
-def sourcecode_args(run_file, run_dir, project_file, project_dir):
+def sourcecode_args(run_file, run_dir, project_file, project_dir, data=None):
     """Returns manifest args for a source code file.
 
     Args:
 
         ['s', run_relative_path, sha1, project_relative_path]
 
+    `data`, if given, is the file's content, hashed in place of reading
+    `run_file`.
     """
     dest_arg = _relpath(run_file, run_dir)
-    hash_arg = util.file_sha1(run_file)
+    if data is not None:
+        import hashlib
+
+        hash_arg = hashlib.sha1(data).hexdigest()
+    else:
+        hash_arg = util.file_sha1(run_file)
     src_arg = _relpath(project_file, project_dir)
     return ["s", dest_arg, hash_arg, src_arg]
 
