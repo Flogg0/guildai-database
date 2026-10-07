@@ -30,7 +30,7 @@ class RScriptProcessError(Exception):
 
 
 def is_r_script(opspec):
-    return os.path.isfile(opspec) and opspec[-2:].upper() == ".R"
+    return opspec[-2:].upper() == ".R" and os.path.isfile(opspec)
 
 
 def verify_r_env():

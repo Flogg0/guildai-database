@@ -382,7 +382,11 @@ def _trunc_len(truncate_floats):
 
 
 def _is_path(val):
-    return isinstance(val, str) and os.path.sep in val and os.path.exists(val)
+    return (
+        isinstance(val, str)
+        and os.path.sep in val
+        and util.static_path_test(os.path.exists, val)
+    )
 
 
 def _path_len(shorten_paths):

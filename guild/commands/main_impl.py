@@ -19,6 +19,7 @@ import stat
 from guild import cli
 from guild import config
 from guild import log
+from guild import util
 
 
 def main(args):
@@ -102,13 +103,28 @@ def _validated_dir(path):
 def _maybe_apply_guild_home(args):
     if not args.guild_home:
         return
-    config.set_guild_home(_validated_dir(args.guild_home))
+    config.set_guild_home(_validated_guild_home(args.guild_home))
+
+
+_validated_guild_homes = {}
+
+
+def _validated_guild_home(path):
+    # Batch stagers run this command once per run in one process; with a
+    # static project, validate the same Guild home once.
+    if not util.static_project():
+        return _validated_dir(path)
+    try:
+        return _validated_guild_homes[path]
+    except KeyError:
+        validated = _validated_guild_homes[path] = _validated_dir(path)
+        return validated
 
 
 def _apply_guild_patch():
     """Look in current directory for guild_patch.py and load if exists."""
     patch_path = "guild_patch.py"
-    if os.path.exists(patch_path):
+    if util.static_path_test(os.path.exists, patch_path):
         from guild import python_util
 
         python_util.exec_script(patch_path)
