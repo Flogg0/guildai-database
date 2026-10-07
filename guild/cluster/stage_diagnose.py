@@ -53,13 +53,14 @@ def _runs_dir():
 
 def _staging_env_setup(tmp_home):
     """Set GUILD_HOME plus the same env the real parallel stager uses (worker
-    mode + a precomputed GUILD_VCS_COMMIT), so the probes measure the actual
-    optimized staging path rather than the un-optimized one. Returns prior
-    values for restore."""
-    keys = ("GUILD_HOME", "GUILD_NO_INDEX_WRITES", "GUILD_VCS_COMMIT")
+    mode, static project + a precomputed GUILD_VCS_COMMIT), so the probes
+    measure the actual optimized staging path rather than the un-optimized
+    one. Returns prior values for restore."""
+    keys = ("GUILD_HOME", "GUILD_NO_INDEX_WRITES", "GUILD_STATIC_PROJECT", "GUILD_VCS_COMMIT")
     prev = {k: os.environ.get(k) for k in keys}
     os.environ["GUILD_HOME"] = tmp_home
     os.environ["GUILD_NO_INDEX_WRITES"] = "1"
+    os.environ["GUILD_STATIC_PROJECT"] = "1"
     if not os.environ.get("GUILD_VCS_COMMIT") and os.environ.get("NO_VCS_COMMIT") != "1":
         try:
             from guild import config, op_util
@@ -281,6 +282,7 @@ def _diag_stage_task(argv):
     import re as _re
     import contextlib as _cl
     _os.environ["GUILD_NO_INDEX_WRITES"] = "1"
+    _os.environ["GUILD_STATIC_PROJECT"] = "1"
     err = None
     run_id = None
     buf = _io.StringIO()
