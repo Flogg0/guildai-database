@@ -197,7 +197,7 @@ def _precompute_vcs_commit():
         os.environ["GUILD_VCS_COMMIT"] = val
 
 
-def _resync_index():
+def _resync_index(n_jobs=None):
     """Fold the per-run dirty markers left by writes-disabled staging into the
     SQLite index in a single delta sync, so the index is consistent when
     staging returns instead of resyncing lazily on the user's next command.
@@ -205,13 +205,25 @@ def _resync_index():
     Writes must be enabled here (pop the worker flag in case a non-process
     joblib backend set it in this process); opening the index with fresh
     markers present triggers the delta sync over only the staged runs.
+
+    The sync's per-run reads run on as many threads as staging used workers,
+    unless GUILD_RESYNC_WORKERS says otherwise: staging just did the same
+    number of runs' worth of filesystem round-trips in parallel, and reading
+    them back serially is the slow tail of a large batch.
     """
     os.environ.pop("GUILD_NO_INDEX_WRITES", None)
+    set_workers = "GUILD_RESYNC_WORKERS" not in os.environ
+    if set_workers:
+        n = joblib.cpu_count() if n_jobs is None else joblib.effective_n_jobs(n_jobs)
+        os.environ["GUILD_RESYNC_WORKERS"] = str(n)
     try:
         from guild import var
         var._get_index_conn()
     except Exception as e:
         print(f"Index resync after staging failed (will resync on next read): {e}")
+    finally:
+        if set_workers:
+            os.environ.pop("GUILD_RESYNC_WORKERS", None)
 
 
 def split_list(the_list, the_element, other=None):
@@ -274,7 +286,7 @@ def main():
     if not pargs.dry_run:
         _precompute_vcs_commit()
         parallel_stage_trials(trial_commands, n_jobs=pargs.n_jobs)
-        _resync_index()
+        _resync_index(pargs.n_jobs)
 
 
 if __name__ == "__main__":

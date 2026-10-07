@@ -154,10 +154,15 @@ def _dirty_runs_dir(root=None):
 _dirty_runs_dir_ensured = set()
 
 
-def _touch_run_dirty_marker(root, run_id):
+def _touch_run_dirty_marker(root, run_id, row=None):
     """Mark a single run as needing resync. Workers call this per write
     instead of touching the global dirty marker, so the headnode can do a
     delta sync over only the touched runs.
+
+    `row`, the run's index row as of this write, is stored in the marker so
+    the sync can take it instead of re-reading the run dir (see
+    _marker_row). A marker touched without one is left empty - truncating
+    any row an earlier write stored, which no longer describes the run.
     """
     # Run ids are always 32-char hex (runlib.mkid). Skip anything else -- e.g.
     # the proto sub-run, which is not a queryable run; it would only create a
@@ -173,16 +178,25 @@ def _touch_run_dirty_marker(root, run_id):
             return
         _dirty_runs_dir_ensured.add(d)
     path = os.path.join(d, run_id)
+    data = json.dumps({"v": 1, "row": list(row)}).encode() if row else b""
     try:
-        # A marker created here already has a fresh mtime; only an existing
-        # one needs bringing forward. (Opening it for append and then setting
-        # the time is two round-trips on NFS for the common, new-file case.)
+        # A marker created here already has a fresh mtime and no content; an
+        # existing one is truncated (dropping a row stored for an earlier
+        # state of the run) and its time brought forward.
         try:
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            existed = False
         except FileExistsError:
-            os.utime(path, None)
-        else:
+            fd = os.open(path, os.O_WRONLY | os.O_TRUNC)
+            existed = True
+        try:
+            view = memoryview(data)
+            while view:
+                view = view[os.write(fd, view):]
+        finally:
             os.close(fd)
+        if existed:
+            os.utime(path, None)
     except OSError as e:
         log.debug("Failed to touch per-run dirty marker at %s: %s", path, e)
 
@@ -263,6 +277,64 @@ def _record_marker_synced(conn, run_id, mtime):
         )
     except sqlite3.OperationalError:
         pass
+
+
+def _worker_index_row(root, run):
+    """The index row for a run a worker just wrote, for its dirty marker.
+
+    None if there is no Run to read (or it isn't a run in root), or the read
+    fails - the marker is then written without a row and the sync reads the
+    run dir as before.
+    """
+    if run is None or os.path.dirname(run.path) != (root or runs_dir()):
+        return None
+    # Build the row from the run itself; the guard keeps Run reads from
+    # consulting (or opening) the index DB, which a worker never does.
+    prev = getattr(_index_local, 'in_dirty_sync', False)
+    _index_local.in_dirty_sync = True
+    try:
+        return _index_run_row(run)
+    except Exception as e:
+        log.debug("could not build index row for %s: %s", run.id, e)
+        return None
+    finally:
+        _index_local.in_dirty_sync = prev
+
+
+def _marker_row(root, run_id):
+    """The index row stored in run_id's dirty marker, or None.
+
+    None when the marker is empty (touched without a row, or truncated by a
+    later write), unreadable, or holds anything but a complete row for this
+    run - the caller then reads the run dir.
+    """
+    try:
+        with open(os.path.join(_dirty_runs_dir(root), run_id), "rb") as f:
+            data = f.read()
+    except OSError:
+        return None
+    if not data:
+        return None
+    try:
+        obj = json.loads(data)
+        row = obj["row"]
+    except (ValueError, KeyError, TypeError):
+        return None
+    if obj.get("v") != 1 or len(row) != len(_INDEX_UPSERT_COLS) or row[0] != run_id:
+        return None
+    return tuple(row)
+
+
+# Statuses a run keeps until something else is written to it (which writes
+# a new marker); "running" is not one of them.
+_SETTLED_STATUSES = frozenset(("staged", "pending", "completed", "error", "terminated"))
+
+
+def _definitive_status(guild_names, attr_names):
+    """_has_definitive_status from listings of .guild and .guild/attrs."""
+    if "exit_status" in attr_names:
+        return True
+    return any(m in guild_names for m in ("STAGED", "PENDING", "LOCK.remote"))
 
 
 def _clear_run_dirty_marker_if_unchanged(root, run_id, seen_mtime):
@@ -568,7 +640,7 @@ def _get_index_conn(root=None):
     return conn
 
 
-def _index_safe_write(fn, root=None, run_id=None, run_ids=None):
+def _index_safe_write(fn, root=None, run_id=None, run_ids=None, run=None):
     """Run fn under the index lock, retrying once on transient errors.
 
     Only rebuilds the index when SQLite reports actual file-level
@@ -594,6 +666,13 @@ def _index_safe_write(fn, root=None, run_id=None, run_ids=None):
         pending = getattr(_index_local, 'pending_markers', None)
         if pending is not None:
             pending.update(ids)
+            # The run each marker will describe: the Run written through, or
+            # None for a write that came without one (a removal, a prune),
+            # whose marker then carries no row. The last write wins.
+            runs = getattr(_index_local, 'pending_runs', None)
+            if runs is not None:
+                for rid in ids:
+                    runs[rid] = run if run is not None and run.id == rid else None
             return
         for rid in ids:
             if rid is not None:
@@ -648,6 +727,7 @@ def index_batch_writes(root=None):
         depth = getattr(_index_local, 'marker_batch_depth', 0)
         if depth == 0:
             _index_local.pending_markers = set()
+            _index_local.pending_runs = {}
         _index_local.marker_batch_depth = depth + 1
         try:
             yield
@@ -655,14 +735,18 @@ def index_batch_writes(root=None):
             _index_local.marker_batch_depth -= 1
             if _index_local.marker_batch_depth == 0:
                 markers = _index_local.pending_markers
+                runs = _index_local.pending_runs
                 _index_local.pending_markers = None
+                _index_local.pending_runs = None
                 if None in markers:
                     # A global-marker write forces a full resync that already
                     # covers every run, so per-run markers are redundant.
                     _touch_dirty_marker(root)
                 else:
                     for rid in markers:
-                        _touch_run_dirty_marker(root, rid)
+                        _touch_run_dirty_marker(
+                            root, rid, _worker_index_row(root, runs.get(rid))
+                        )
         return
     depth = getattr(_index_local, 'batch_depth', 0)
     if depth == 0:
@@ -866,11 +950,30 @@ def _do_delta_sync(conn, root, markers):
     def _read(item):
         run_id, mtime = item
         path = os.path.join(root, run_id)
-        if not os.path.isdir(path) or not _opref_exists(path):
+        # A row the worker stored in the marker describes the run as of its
+        # last write: take it, checking only that the run is still there.
+        # Only a settled status is taken from it; a run still executing goes
+        # through the definitive-status check below, which leaves it pending
+        # until it finishes, as before.
+        row = _marker_row(root, run_id)
+        if row is not None and row[1] in _SETTLED_STATUSES:
+            if not _opref_exists(path):
+                return ("delete", run_id, mtime, None)
+            return ("upsert", run_id, mtime, row)
+        # Otherwise read the run: one listing of .guild answers whether it
+        # still exists, its status markers and which attr files to read.
+        guild_names = util.safe_listdir(os.path.join(path, ".guild"))
+        if "opref" not in guild_names:
             return ("delete", run_id, mtime, None)
-        if not _has_definitive_status(path):
+        attr_names = (
+            util.safe_listdir(os.path.join(path, ".guild", "attrs"))
+            if "attrs" in guild_names else []
+        )
+        if not _definitive_status(guild_names, attr_names):
             return ("skip", run_id, mtime, None)
-        row = _index_run_row(runlib.Run(run_id, path))
+        run = runlib.Run(run_id, path)
+        with run.snapshot_reads(guild_names, attr_names):
+            row = _index_run_row(run)
         return ("upsert", run_id, mtime, row)
 
     for kind, run_id, mtime, row in _parallel_read(_read, markers):
@@ -977,6 +1080,9 @@ def _index_run_row(run):
     Pure reads (opref + attrs), no DB access, so this can run in worker
     threads during a sync's parallel read phase.
     """
+    if run._snapshot is None:
+        with run.snapshot_reads():
+            return _index_run_row(run)
     from guild import run_util
 
     opref_str = ""
@@ -1027,12 +1133,18 @@ def _encoded_attr(run, name):
     return json.dumps(val) if val else ""
 
 
+# Columns of a row tuple from _index_run_row, in order.
+_INDEX_UPSERT_COLS = (
+    "run_id", "status", "opref", "op_name", "started", "stopped", "initialized",
+    "label", "flags", "tags", "sourcecode_digest", "opdef_attrs", "compare",
+    "synced_at",
+)
+
+
 def _index_upsert_row(conn, row):
     conn.execute(
-        "INSERT OR REPLACE INTO runs "
-        "(run_id, status, opref, op_name, started, stopped, initialized, label, "
-        "flags, tags, sourcecode_digest, opdef_attrs, compare, synced_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        f"INSERT OR REPLACE INTO runs ({', '.join(_INDEX_UPSERT_COLS)}) "
+        f"VALUES ({', '.join('?' for _ in _INDEX_UPSERT_COLS)})",
         row,
     )
 
@@ -1057,7 +1169,7 @@ def index_update_status(run, status, root=None):
         if conn.total_changes == 0:
             _index_upsert_run(conn, run)
         conn.commit()
-    _index_safe_write(_do, root, run_id=run.id)
+    _index_safe_write(_do, root, run_id=run.id, run=run)
 
 
 def index_update_attr(run, name, val, root=None):
@@ -1093,7 +1205,7 @@ def index_update_attr(run, name, val, root=None):
         else:
             return
         conn.commit()
-    _index_safe_write(_do, root, run_id=run.id)
+    _index_safe_write(_do, root, run_id=run.id, run=run)
 
 
 def index_register_run(run, root=None):
@@ -1107,7 +1219,7 @@ def index_register_run(run, root=None):
         conn = _get_index_conn(root)
         _index_upsert_run(conn, run)
         conn.commit()
-    _index_safe_write(_do, root, run_id=run.id)
+    _index_safe_write(_do, root, run_id=run.id, run=run)
 
 
 def index_put_row(row, root=None):
