@@ -69,7 +69,9 @@ measurable speedups on local disks.
 - With `GUILD_STATIC_PROJECT=1` (set by `guild-parallel-stager`), the project
   is treated as unchanging for the life of the process: which source code
   files to copy - a walk of the whole project tree plus `git ls-files` - and
-  their contents are read once per process, not once per staged run. On a
+  their contents are read once per process, not once per staged run, as are
+  the checks op resolution repeats per run (the Guild file's existence and
+  hash, the Guild home, `guild_patch.py`, path-valued flags). On a
   41k-file project staging a 35-file source code snapshot, this took a staged
   run from ~4,180 path syscalls and 4 subprocesses to ~78 and none.
 - Ships the cluster staging/running tools (`guild-parallel-stager`,

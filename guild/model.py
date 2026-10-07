@@ -25,6 +25,7 @@ from guild import config
 from guild import entry_point_util
 from guild import guildfile
 from guild import namespace
+from guild import util
 
 log = logging.getLogger("guild")
 
@@ -89,10 +90,7 @@ class GuildfileModel(Model):
 
     def _init_reference(self):
         src = self.dist.guildfile.src
-        if src and os.path.isfile(src):
-            version = file_hash(src)
-        else:
-            version = "unknown"
+        version = _guildfile_version(src)
         src = self.dist.guildfile.src
         if src is not None:
             src = os.path.abspath(src)
@@ -277,7 +275,7 @@ class ModelImporter:
 
 
 def _init_guildfile_dist(path):
-    if not os.path.isdir(path):
+    if not util.static_path_test(os.path.isdir, path):
         return None
     try:
         gf = guildfile.for_dir(path)
@@ -320,6 +318,21 @@ class GuildfileNamespace(namespace.PrefixNamespace):
         decoded_project_name = unescape_project_name(parts[0])
         rest = "/" + parts[1] if len(parts) == 2 else ""
         return decoded_project_name + rest
+
+
+_static_guildfile_versions = {}
+
+
+def _guildfile_version(src):
+    # The reference version is a hash of the Guild file, read in full. With a
+    # static project, hash it once per process rather than once per run.
+    static = util.static_project()
+    if static and src in _static_guildfile_versions:
+        return _static_guildfile_versions[src]
+    version = file_hash(src) if src and os.path.isfile(src) else "unknown"
+    if static:
+        _static_guildfile_versions[src] = version
+    return version
 
 
 def file_hash(path):

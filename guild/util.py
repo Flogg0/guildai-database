@@ -1493,6 +1493,27 @@ def static_project():
     return os.getenv("GUILD_STATIC_PROJECT") == "1"
 
 
+_static_path_tests = {}
+
+
+def static_path_test(test, path):
+    """Returns `test(path)` (e.g. os.path.isfile), memoized for the process
+    when the project is static (see `static_project`).
+
+    Op resolution re-checks the same handful of paths - the project's Guild
+    file, its dir, guild_patch.py - for every run a batch stager inits in one
+    process; each check is a filesystem round-trip.
+    """
+    if not static_project():
+        return test(path)
+    key = (test, os.path.abspath(path))
+    try:
+        return _static_path_tests[key]
+    except KeyError:
+        result = _static_path_tests[key] = test(path)
+        return result
+
+
 def safe_listdir(path):
     try:
         return os.listdir(path)

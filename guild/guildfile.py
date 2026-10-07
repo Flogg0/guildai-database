@@ -1643,14 +1643,14 @@ class PackageDef:
 def for_dir(path, no_cache=False):
     log.debug("checking '%s' for model sources", path)
     model_file = os.path.abspath(guildfile_path(path))
-    if os.path.isfile(model_file):
+    if util.static_path_test(os.path.isfile, model_file):
         log.debug("found model source '%s'", model_file)
         return for_file(model_file, no_cache=no_cache)
     raise NoModels(path)
 
 
 def is_guildfile_dir(path):
-    return os.path.exists(guildfile_path(path))
+    return util.static_path_test(os.path.exists, guildfile_path(path))
 
 
 def guildfile_path(*paths):
