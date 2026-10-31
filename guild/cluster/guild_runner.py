@@ -213,13 +213,17 @@ class Worker(object):
 class Runs:
     @staticmethod
     def guild_read(runsfilter="-Se", limit=0):
-        # Push --limit into the guild query (-n) so the SQL LIMIT caps how many
-        # runs the index loads, instead of loading every match and truncating.
-        limit_arg = f" -n {limit}" if limit and limit > 0 else ""
-        guild_command = f"guild runs --json {runsfilter}{limit_arg}"
+        # Only run IDs are used, so ask `guild select --all`: same filters and
+        # order (-timestamp) as `guild runs`, but answered from the index alone.
+        # `guild runs --json` also reads ~9 attrs per run from its run dir --
+        # each a round trip on the cluster's shared filesystem.
+        # select has no --limit; reading all matching IDs is cheap, so cap here.
+        guild_command = f"guild select --all {runsfilter}"
         print(f"guild_command: {guild_command}")
-        output = subprocess.check_output(guild_command, shell=True)
-        runs = json.loads(output)
+        output = subprocess.check_output(guild_command, shell=True, text=True)
+        runs = Runs.bare_ids_to_json(output.split())
+        if limit and limit > 0:
+            runs = runs[:limit]
         return runs
 
     @staticmethod
@@ -451,8 +455,8 @@ def main():
         default=0,
         help=(
             "Process at most this many runs in one invocation. With --guildfilter "
-            "this is pushed into the guild query (SQL LIMIT) so only N runs are "
-            "loaded; with --runids/--runsfile the first N are taken. Use to stay "
+            "the newest N matching runs are taken; with --runids/--runsfile the "
+            "first N are taken. Use to stay "
             "within the cluster's job/array limits (can't submit more than ~10000 "
             "at once): run repeatedly to drain the rest in batches. 0 = no limit."
         ),
@@ -634,8 +638,8 @@ def main():
     # ---- read runs...
     runs = None
     if args.guildfilter:
-        # For a filter the limit is pushed into the guild query (SQL LIMIT), so
-        # only that many runs are ever loaded -- no Python-side truncation below.
+        # For a filter guild_read caps to the newest N before --shuffle, so no
+        # truncation below.
         runs = Runs.guild_read(args.guildfilter, limit=args.limit)
     elif args.runids:
         runs = Runs.bare_ids_to_json(args.runids)
