@@ -406,10 +406,12 @@ so they ship and version with this fork:
   `--limit N` processes at most N runs per invocation, so a run set larger than
   the cluster's ~10000 job/array-task ceiling can be drained in batches: re-run
   the same command and already running/finished runs drop out of the filter, so
-  each invocation picks up the next batch. With `--guildfilter` the limit is
-  pushed into the guild query (SQL `LIMIT`) so only N runs are loaded (the most
-  recent N matching the filter); with `--runids`/`--runsfile` the first N are
-  taken.
+  each invocation picks up the next batch. With `--guildfilter` the limit takes
+  the most recent N runs matching the filter; with `--runids`/`--runsfile` the
+  first N are taken. The filter is passed to `guild select --all`, which
+  answers from the index alone (a constant ~15 guild-home syscalls, vs ~17 per
+  run for `guild runs --json`), so only run filters apply, not `guild runs`
+  list options.
 - **`guild-slurm-jobcount`** — prints how many of a user's SLURM jobs are
   still left to finish, parsing `squeue` text output (`guild-slurm-jobcount
   [USER]`; the user defaults to `$USER`). It is **job-array aware**: running array tasks are listed one per
