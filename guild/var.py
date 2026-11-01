@@ -1846,6 +1846,7 @@ def delete_runs(runs, permanent=False, jobs=1, progress=False):
     with index_batch_writes():
         for run_id in to_remove:
             index_remove_run(run_id)
+    _forget_runs_scalars(to_remove)
     if to_register:
         with index_batch_writes(root=trash_root):
             for run_id, dest in to_register:
@@ -1902,6 +1903,16 @@ def purge_runs(runs, jobs=1, progress=False):
         with index_batch_writes(root=trash_root):
             for run_id in to_remove_from_trash:
                 index_remove_run(run_id, trash_root)
+    _forget_runs_scalars(to_remove_from_trash)
+
+
+def _forget_runs_scalars(run_ids):
+    """Drops deleted runs from the scalars index (guild.index), which
+    `guild compare` reads. A restored run is scanned again on first read."""
+    # Imported here: guild.index imports this module.
+    from guild import index as indexlib
+
+    indexlib.forget_runs(run_ids)
 
 
 def _delete_run_dirs(dirs, jobs=1, progress=False):

@@ -9,7 +9,9 @@ these tests count filesystem access directly.
 """
 
 import builtins
+import collections
 import glob as globmod
+import io
 import json
 import os
 import shutil
@@ -69,28 +71,31 @@ class _FSCounter:
     def __init__(self, root):
         self.root = root
         self.hits = []
+        self.calls = []
         self._orig = {}
 
-    def _record(self, path):
+    def _record(self, path, name=None):
         try:
             path = os.fspath(path)
         except TypeError:
             return
         if isinstance(path, str) and path.startswith(self.root):
             self.hits.append(path)
+            self.calls.append((name, path))
 
     def __enter__(self):
         targets = [
             (os, "stat"), (os, "lstat"), (os, "listdir"), (os, "scandir"),
-            (os, "walk"), (os, "open"), (builtins, "open"), (globmod, "glob"),
+            (os, "walk"), (os, "open"), (builtins, "open"), (io, "open"),
+            (globmod, "glob"),
         ]
         for obj, name in targets:
             orig = getattr(obj, name)
             self._orig[(obj, name)] = orig
 
-            def wrapper(*args, _orig=orig, **kw):
+            def wrapper(*args, _orig=orig, _name=name, **kw):
                 if args:
-                    self._record(args[0])
+                    self._record(args[0], _name)
                 return _orig(*args, **kw)
 
             setattr(obj, name, wrapper)
@@ -420,5 +425,225 @@ def test_run_without_index_row_still_reads_from_disk():
         scalars = index.run_scalars(runs[0])
         assert scalars and scalars[0]["last_val"] == 0.75, scalars
         assert index.run_attr(runs[0], "status") is not None
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_scan_event_dirs_matches_os_walk():
+    """scan_event_dirs walks with directory entries rather than os.walk plus
+    an lstat per subdir. What it finds -- which linked dirs it follows, and
+    the order dirs come back in -- must be what the os.walk version found,
+    apart from .guild/attrs and .guild/proto, which it no longer descends
+    into."""
+    tmpdir = _fresh_guild_home()
+    runs_dir = os.path.join(tmpdir, "runs")
+    try:
+        from guild import tfevent
+
+        run_path = _make_run(runs_dir, "1" * 32, scalars=[("loss", 0.5, 1)])
+        _write_scalars(os.path.join(run_path, "logs", "train"), [("acc", 0.9, 1)])
+        _write_scalars(os.path.join(run_path, "logs", "eval"), [("acc", 0.8, 1)])
+        # A linked dir that is a run is followed; any other linked dir is not.
+        other_run = _make_run(runs_dir, "2" * 32, scalars=[("loss", 0.1, 1)])
+        os.symlink(other_run, os.path.join(run_path, "upstream"))
+        not_a_run = os.path.join(tmpdir, "elsewhere")
+        _write_scalars(not_a_run, [("loss", 0.2, 1)])
+        os.symlink(not_a_run, os.path.join(run_path, "elsewhere"))
+        os.makedirs(os.path.join(run_path, ".guild", "proto", ".guild"))
+
+        expected = []
+        for root, dirs, files in os.walk(run_path, followlinks=True):
+            tfevent._del_non_run_linked_dirs(dirs, root)
+            if root == os.path.join(run_path, ".guild"):
+                dirs[:] = [name for name in dirs if name not in ("attrs", "proto")]
+            event_files = [name for name in files if tfevent._is_event_file(name)]
+            if event_files:
+                expected.append(
+                    (
+                        root,
+                        any(tfevent._is_summary_attrs(name) for name in files),
+                        sorted(event_files),
+                    )
+                )
+
+        found, guild_names = tfevent.scan_run_dir(run_path)
+        assert found == expected, (found, expected)
+        assert tfevent.scan_event_dirs(run_path) == found
+        found_dirs = {os.path.relpath(path, run_path) for path, _, _ in found}
+        assert found_dirs == {
+            ".guild", "logs/train", "logs/eval", "upstream/.guild"
+        }, found_dirs
+        assert sorted(guild_names) == sorted(
+            os.listdir(os.path.join(run_path, ".guild"))
+        ), guild_names
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_first_read_of_a_run_lists_each_dir_once():
+    """Reading a run the index hasn't scanned yet has to walk it and read
+    its events, but no more than once: one listing per dir (never
+    .guild/attrs, which holds only attr files), no lstat per subdir, no
+    batch check beyond the .guild listing, no second listing to find the
+    event files the walk just found, and one open per event file. On
+    networked storage each of those is a round-trip, paid for every run the
+    first time it is compared."""
+    tmpdir = _fresh_guild_home()
+    runs_dir = os.path.join(tmpdir, "runs")
+    try:
+        from guild import index as indexlib
+
+        run_id = "9" * 32
+        run_path = _make_run(runs_dir, run_id, scalars=[("loss", 0.5, 1)])
+        _index_and_register(runs_dir, [run_id])
+
+        index = indexlib.RunIndex()
+        runs = _fresh_runs(runs_dir, [run_id])
+        with _FSCounter(run_path) as counter:
+            # As compare does: drop batch runs, then refresh the rest.
+            index.batch_runs(runs)
+            index.refresh(runs)
+            scalars = index.run_scalars(runs[0])
+        assert [s["last_val"] for s in scalars] == [0.5], scalars
+
+        guild_dir = os.path.join(run_path, ".guild")
+        listings = collections.Counter(
+            path for name, path in counter.calls
+            if name in ("listdir", "scandir", "walk", "glob")
+        )
+        assert listings == {run_path: 1, guild_dir: 1}, listings
+        lstats = [path for name, path in counter.calls if name == "lstat"]
+        assert not lstats, lstats
+        proto = os.path.join(guild_dir, "proto")
+        assert not [c for c in counter.calls if c[1] == proto], counter.calls
+        event_opens = [
+            path for name, path in counter.calls
+            if name == "open" and ".tfevents." in path
+        ]
+        assert len(event_opens) == 1, event_opens
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_deleting_a_run_drops_it_from_the_scalars_index():
+    """Nothing else removes a run's rows from the scalars index, which
+    otherwise keeps every deleted run's scalars and scan for good."""
+    tmpdir = _fresh_guild_home()
+    runs_dir = os.path.join(tmpdir, "runs")
+    try:
+        from guild import index as indexlib
+        from guild import var as gvar
+
+        ids = ["7" * 32, "8" * 32, "6" * 32]
+        for run_id in ids:
+            _make_run(runs_dir, run_id, scalars=[("loss", 0.5, 1)])
+        _index_and_register(runs_dir, ids)
+        indexlib.RunIndex().refresh(_fresh_runs(runs_dir, ids))
+        tables = ("scalar", "scalar_source", "run_scan")
+
+        def indexed_runs():
+            db = sqlite3.connect(os.path.join(gvar.cache_dir("runs"), indexlib.DB_NAME))
+            try:
+                return {
+                    table: {row[0] for row in db.execute(f"SELECT run FROM {table}")}
+                    for table in tables
+                }
+            finally:
+                db.close()
+
+        assert indexed_runs() == {table: set(ids) for table in tables}
+
+        trashed, removed, kept = _fresh_runs(runs_dir, ids)
+        gvar.delete_runs([trashed])
+        gvar.delete_runs([removed], permanent=True)
+        assert indexed_runs() == {table: {kept.id} for table in tables}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def test_batch_check_comes_from_the_walk():
+    """A batch run is one with .guild/proto. For a run not yet scanned, the
+    walk that the refresh needs anyway lists .guild, so batch_runs asks it
+    rather than looking proto up -- and what it records is the same."""
+    tmpdir = _fresh_guild_home()
+    runs_dir = os.path.join(tmpdir, "runs")
+    try:
+        from guild import index as indexlib
+
+        batch_id, trial_id = "4" * 32, "5" * 32
+        batch_path = _make_run(runs_dir, batch_id)
+        os.makedirs(os.path.join(batch_path, ".guild", "proto", ".guild"))
+        _make_run(runs_dir, trial_id, scalars=[("loss", 0.5, 1)])
+        _index_and_register(runs_dir, [batch_id, trial_id])
+
+        index = indexlib.RunIndex()
+        runs = _fresh_runs(runs_dir, [batch_id, trial_id])
+        with _FSCounter(runs_dir) as counter:
+            batch = index.batch_runs(runs)
+            index.refresh(runs)
+        assert batch == {batch_id}, batch
+        proto_lookups = [c for c in counter.calls if c[1].endswith("/.guild/proto")]
+        assert not proto_lookups, proto_lookups
+
+        recorded = indexlib.RunIndex()._recorded_scans(runs)
+        assert recorded[batch_id][2] is True, recorded[batch_id]
+        assert recorded[trial_id][2] is False, recorded[trial_id]
+        # Served from the record from now on.
+        assert indexlib.RunIndex().batch_runs(_fresh_runs(runs_dir, [batch_id, trial_id])) == {batch_id}
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+def _event_file(guild_dir):
+    [name] = [name for name in os.listdir(guild_dir) if ".tfevents." in name]
+    return os.path.join(guild_dir, name)
+
+
+def _events_as_read(path):
+    """(events read by Guild's reader, events read by TB's), serialized."""
+    from guild import tensorboard_util
+    from tensorboard.backend.event_processing import event_file_loader
+
+    ours = [e.SerializeToString() for e in tensorboard_util._read_event_file(path)]
+    tb = [
+        e.SerializeToString()
+        for e in event_file_loader.LegacyEventFileLoader(path).Load()
+    ]
+    return ours, tb
+
+
+def test_event_file_reader_reads_what_tensorboard_reads():
+    """_read_event_file stands in for TB's stub reader, so it must yield the
+    same events -- including from files TB stops reading part-way: one a run
+    is still writing, which ends mid-record, and one with a record that fails
+    its CRC check."""
+    tmpdir = _fresh_guild_home()
+    try:
+        guild_dir = os.path.join(tmpdir, "events")
+        _write_scalars(guild_dir, [("loss", 1.0 / step, step) for step in range(1, 11)])
+        path = _event_file(guild_dir)
+        with open(path, "rb") as f:
+            data = f.read()
+
+        ours, tb = _events_as_read(path)
+        assert len(tb) == 11, len(tb)  # file version event + 10 scalars
+        assert ours == tb
+
+        # Cut the last record short, as an interrupted write leaves it.
+        with open(path, "wb") as f:
+            f.write(data[:-7])
+        ours, tb = _events_as_read(path)
+        assert len(tb) == 10, len(tb)
+        assert ours == tb
+
+        # Corrupt a byte in the middle of the file: TB stops at the record
+        # holding it, and so must this.
+        corrupt = bytearray(data)
+        corrupt[len(data) // 2] ^= 0xFF
+        with open(path, "wb") as f:
+            f.write(bytes(corrupt))
+        ours, tb = _events_as_read(path)
+        assert 0 < len(tb) < 11, len(tb)
+        assert ours == tb
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
