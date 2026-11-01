@@ -504,6 +504,8 @@ class RunIndex:
         self.path = path or var.cache_dir("runs")
         self._db = self._init_db()
         self._clean = set()
+        self._batch = {}
+        self._walked = {}
         self._attr_reader = AttrReader()
         self._flag_reader = FlagReader()
         self._scalar_reader = ScalarReader(self._db)
@@ -514,6 +516,13 @@ class RunIndex:
         db = sqlite3.connect(db_path, timeout=300)
         db.execute("PRAGMA busy_timeout=300000")
         db.execute("PRAGMA synchronous=NORMAL")
+        # A refresh looks up every run in each table, 500 ids at a time, and
+        # the default cache (2 MB) evicts pages a later chunk reads again;
+        # writing a refresh's results also spills dirty pages to the file
+        # before the commit writes them once more. Each page is a read or
+        # write on the DB file, so give the cache room for the pages one
+        # refresh touches. A ceiling, not an allocation.
+        db.execute("PRAGMA cache_size=-65536")
         _init_run_index_tables(db)
         return db
 
@@ -557,8 +566,6 @@ class RunIndex:
         run scan and served from there; without that, callers that filter
         batches out stat .guild/proto for every run on every invocation.
         """
-        from guild import batch_util
-
         recorded = self._recorded_scans(runs)
         batch = set()
         for run in runs:
@@ -567,9 +574,29 @@ class RunIndex:
             if scan is not None and stamp is not None and scan[0] == stamp:
                 if scan[2]:
                     batch.add(run.id)
-            elif batch_util.is_batch(run):
+            elif self._is_batch(run):
                 batch.add(run.id)
         return batch
+
+    def _is_batch(self, run):
+        """Whether run is a batch (has .guild/proto), for a run not scanned.
+
+        Answered by walking the run, which lists .guild anyway, rather than
+        a lookup of its own. The walk is kept for the refresh that follows,
+        which needs it too.
+        """
+        try:
+            return self._batch[run.id]
+        except KeyError:
+            self._walked[run.id] = self._walk(run)
+            return self._batch[run.id]
+
+    def _walk(self, run):
+        found, guild_names = tfevent.scan_run_dir(run.dir)
+        # Batch-ness is fixed once a run is created, so it is kept for as
+        # long as this index is; a walk's event dirs are used once.
+        self._batch[run.id] = "proto" in guild_names
+        return found
 
     def _run_event_dirs(self, runs):
         """Maps run id -> list of dirs holding that run's event files.
@@ -584,8 +611,6 @@ class RunIndex:
         A run with no event dirs is recorded as such, so "no events" is
         distinguishable from "not yet scanned" and does not re-walk forever.
         """
-        from guild import batch_util
-
         recorded = self._recorded_scans(runs)
         dirs = {}
         new_records = []
@@ -603,7 +628,9 @@ class RunIndex:
                     for prefix, has_attrs, names in scan[1]
                 ]
                 continue
-            found = tfevent.scan_event_dirs(run.dir)
+            found = self._walked.pop(run.id, None)
+            if found is None:
+                found = self._walk(run)
             dirs[run.id] = found
             new_records.append(
                 (
@@ -615,7 +642,7 @@ class RunIndex:
                             for path, has_attrs, names in found
                         ]
                     ),
-                    1 if batch_util.is_batch(run) else 0,
+                    1 if self._batch[run.id] else 0,
                 )
             )
         if new_records:
@@ -726,6 +753,32 @@ def _init_run_index_tables(db):
     for col in ("is_batch", "synced_at"):
         if col not in scan_cols:
             db.execute(f"ALTER TABLE run_scan ADD COLUMN {col} INTEGER")
+
+
+def forget_runs(run_ids):
+    """Drops what the index holds for runs that have been deleted.
+
+    Nothing else removes a run's rows, so without this the index keeps the
+    scalars and scan of every run ever deleted, and each refresh's lookups
+    page through them.
+    """
+    db_path = os.path.join(var.cache_dir("runs"), DB_NAME)
+    if not run_ids or not os.path.exists(db_path):
+        return
+    db = sqlite3.connect(db_path, timeout=300)
+    try:
+        _init_run_index_tables(db)
+        for i in range(0, len(run_ids), _ID_CHUNK):
+            chunk = run_ids[i:i + _ID_CHUNK]
+            placeholders = ", ".join("?" for _ in chunk)
+            for table in ("scalar", "scalar_source", "run_scan"):
+                db.execute(f"DELETE FROM {table} WHERE run IN ({placeholders})", chunk)
+        db.commit()
+    except sqlite3.Error as e:
+        # A derived cache: failing to prune it must not fail the delete.
+        log.debug("Unable to drop deleted runs from %s: %s", db_path, e)
+    finally:
+        db.close()
 
 
 def iter_run_scalars(run):

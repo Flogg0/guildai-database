@@ -30,16 +30,25 @@ log = logging.getLogger("guild")
 
 
 class EventReader:
-    def __init__(self, dir, all_events=False, path_filter=None):
+    """Reads the events in dir.
+
+    `names`, when given, are the dir's event file names as a scan just found
+    them; they are read as they are instead of listing the dir to find them.
+    """
+
+    def __init__(self, dir, all_events=False, path_filter=None, names=None):
         self.dir = dir
         self.all_events = all_events
         self.path_filter = path_filter
+        self.names = names
 
     def __iter__(self):
         """Yields event for all available events in dir."""
         _ensure_tb_logging_patched()
         try:
-            for event in tensorboard_util.iter_tf_events(self.dir, self.path_filter):
+            for event in tensorboard_util.iter_tf_events(
+                self.dir, self.path_filter, self.names
+            ):
                 if self.all_events or event.HasField("summary"):
                     yield event
         except Exception as e:
@@ -58,14 +67,16 @@ def _log_tfevent_iter_error(dir, e):
 
 
 class ScalarReader:
-    def __init__(self, dir):
+    def __init__(self, dir, names=None):
         self.dir = dir
+        self.names = names
 
     def __iter__(self):
         """Yields (tag, val, step) for all scalars in dir."""
         for event in EventReader(
             self.dir,
             lambda path: not path.endswith(".attrs"),
+            names=self.names,
         ):
             for val in event.summary.value:
                 scalar_info = _try_scalar_event(event, val)
@@ -126,13 +137,18 @@ def scalar_readers_for(dirs):
     Knowing the filenames means the digest can be recomputed by stat'ing each
     one, instead of listing the directory to discover them again. Falls back
     to listing when the recorded names no longer match what is on disk.
+
+    The readers take the same names, so reading a dir's scalars doesn't list
+    it either. That relies on the names coming from a scan that just ran,
+    which is how the run index calls this.
     """
     _ensure_tb_logging_patched()
     for path, names in dirs:
         digest = _digest_for_known_files(path, names) if names else None
         if digest is None:
             digest = _event_files_digest(path)
-        yield path, digest, ScalarReader(path)
+            names = None
+        yield path, digest, ScalarReader(path, names)
 
 
 def _digest_for_known_files(dir, names):
@@ -171,9 +187,25 @@ def scan_event_dirs(root_path):
     `event_filenames` are the dir's event logs, which let a caller recompute
     the staleness digest without listing the dir again.
     """
+    return scan_run_dir(root_path)[0]
+
+
+def scan_run_dir(run_dir):
+    """Returns (scan_event_dirs(run_dir), names in run_dir/.guild).
+
+    The walk lists .guild anyway, so a caller that also needs to know what
+    it holds -- whether the run is a batch, say -- gets that without a
+    lookup of its own.
+    """
     found = []
-    for root, dirs, files in os.walk(root_path, followlinks=True):
-        _del_non_run_linked_dirs(dirs, root)
+    guild_names = []
+    guild_dir = os.path.join(run_dir, ".guild")
+    for root, dirs, files in _walk_run_dir(run_dir):
+        if root == guild_dir:
+            guild_names = dirs + files
+            # Guild's own: one file per run attr, and a batch's prototype
+            # run, which never runs. Neither holds event logs.
+            dirs[:] = [name for name in dirs if name not in ("attrs", "proto")]
         event_files = [name for name in files if _is_event_file(name)]
         if event_files:
             found.append(
@@ -183,7 +215,40 @@ def scan_event_dirs(root_path):
                     sorted(event_files),
                 )
             )
-    return found
+    return found, guild_names
+
+
+def _walk_run_dir(top):
+    """Walks top like os.walk(top, followlinks=True) + _del_non_run_linked_dirs.
+
+    The difference is where a dir's link-ness comes from: its directory entry
+    here, an lstat apiece there -- one filesystem round-trip per subdirectory
+    of every run scanned. Like os.walk, callers may prune `dirs` in place.
+    """
+    try:
+        with os.scandir(top) as it:
+            entries = list(it)
+    except OSError:
+        return
+    dirs = []
+    files = []
+    for entry in entries:
+        try:
+            is_dir = entry.is_dir()
+        except OSError:
+            is_dir = False
+        if not is_dir:
+            files.append(entry.name)
+            continue
+        try:
+            is_link = entry.is_symlink()
+        except OSError:
+            is_link = False
+        if not is_link or _is_run(entry.path):
+            dirs.append(entry.name)
+    yield top, dirs, files
+    for name in dirs:
+        yield from _walk_run_dir(os.path.join(top, name))
 
 
 def _tfevent_subdirs(dir):

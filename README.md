@@ -106,6 +106,24 @@ What made the difference:
   which subdirs hold event files, whether any hold logged attrs, and the
   event filenames. The staleness digest is then recomputed by `stat`-ing
   those known files rather than listing the directory to rediscover them.
+- **A run's first read lists each of its dirs once.** The scan that fills
+  `run_scan` takes each subdir's link-ness from its directory entry rather
+  than an `lstat`, skips `.guild/attrs` and `.guild/proto` (attr files and
+  a batch's prototype run), and answers whether the run is a batch from
+  its `.guild` listing. The event filenames it found go straight to the
+  scalar reader, which opens each file once: TensorBoard's own reader,
+  without TensorFlow (Guild never loads it), re-opens the file and checks
+  it exists on every read. Records are still CRC-checked. Over 26k
+  completed runs, the first `guild compare --csv` after they finish went
+  from ~53 file syscalls per run to ~17.
+- **The scalars cache reads each page once.** Its SQLite page cache is
+  64 MB rather than the default 2 MB, which evicted pages that later
+  lookups of the same refresh read again. A repeat `guild compare --csv`
+  over the same 26k runs went from ~18.7k file operations to ~8.7k.
+- **Deleted runs leave the scalars cache.** `guild runs rm` and `guild runs
+  purge` drop a run's `scalar`, `scalar_source` and `run_scan` rows.
+  Before, nothing did: one measured store's cache was 86 MB, all of it for
+  runs long deleted, which every refresh paged through.
 - **Invalidation is the dirty-marker protocol, nothing else.** Every write
   of a run's row from disk stamps `synced_at`; the scan record stores that
   stamp and treats a change as its only invalidation signal. A run the

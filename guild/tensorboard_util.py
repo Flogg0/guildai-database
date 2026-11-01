@@ -15,6 +15,7 @@
 import logging
 import os
 import socket
+import struct
 import time
 import warnings
 
@@ -103,10 +104,12 @@ def silence_info_logging():
     logger.debug = lambda *_args, **_kw: None
 
 
-def iter_tf_events(dir, path_filter=None):
+def iter_tf_events(dir, path_filter=None, names=None):
     from tensorboard.backend.event_processing import directory_watcher
     from tensorboard.backend.event_processing import event_file_loader
 
+    if names is not None:
+        return _iter_tf_event_files(dir, names, path_filter)
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", Warning)
         return directory_watcher.DirectoryWatcher(
@@ -114,6 +117,78 @@ def iter_tf_events(dir, path_filter=None):
             event_file_loader.LegacyEventFileLoader,
             _summary_events_file_filter(path_filter),
         ).Load()
+
+
+def _iter_tf_event_files(dir, names, path_filter=None):
+    """Yields the events in dir's named event files, oldest file first.
+
+    These are the events DirectoryWatcher.Load yields for a dir holding
+    exactly these files, read without listing the dir before and after each
+    file to find them -- two round-trips per dir on a networked filesystem.
+    """
+    from tensorboard.backend.event_processing import directory_watcher
+    from tensorboard.backend.event_processing import event_file_loader
+    from tensorboard.compat import tf
+
+    if tf.__version__ == "stub":
+        load = _read_event_file
+    else:
+        load = lambda path: event_file_loader.LegacyEventFileLoader(path).Load()
+    file_filter = _summary_events_file_filter(path_filter)
+    paths = sorted(
+        path for path in (os.path.join(dir, name) for name in names)
+        if file_filter(path)
+    )
+    try:
+        for path in paths:
+            yield from load(path)
+    except (tf.errors.OpError, OSError):
+        # Same handling as DirectoryWatcher.Load. The stub reader raises
+        # OpError for a file it can't open where _read_event_file raises
+        # OSError.
+        if not tf.io.gfile.exists(dir):
+            raise directory_watcher.DirectoryDeletedError(
+                f"Directory {dir} has been permanently deleted"
+            )
+
+
+# One read returns a typical event file whole; a large one is read in pieces
+# this size rather than all at once.
+_EVENT_READ_CHUNK = 1 << 20
+
+
+def _read_event_file(path):
+    """Yields the events in a TF event file, opening it once.
+
+    Used in place of TB's loader when it runs without TensorFlow, as Guild
+    has it do (see set_notf). TB's stub reader re-opens the file and checks
+    that it exists on every read it makes: several round-trips per file on a
+    networked filesystem, and the first compare of a set of runs reads every
+    one of their event files.
+
+    Records are checked as the stub checks them, CRCs included, and as in
+    RawEventFileLoader.Load, a record that is cut short or fails its check
+    ends the file -- what a run still writing leaves at the end.
+    """
+    from tensorboard.compat.proto import event_pb2
+    from tensorboard.compat.tensorflow_stub.pywrap_tensorflow import masked_crc32c
+
+    with open(path, "rb", buffering=_EVENT_READ_CHUNK) as f:
+        while True:
+            header = f.read(12)
+            if len(header) < 12:
+                return
+            length, header_crc = struct.unpack("<QI", header)
+            if masked_crc32c(header[:8]) != header_crc:
+                return
+            body = f.read(length + 4)
+            if len(body) < length + 4:
+                return
+            data = body[:length]
+            (data_crc,) = struct.unpack("<I", body[length:])
+            if masked_crc32c(data) != data_crc:
+                return
+            yield event_pb2.Event.FromString(data)
 
 
 def _summary_events_file_filter(path_filter=None):
